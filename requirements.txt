@@ -2,6 +2,7 @@ streamlit
 matplotlib
 seaborn
 openpyxl
+pdfplumber
 
 # Data Manipulation
 pandas>=2.0.0
