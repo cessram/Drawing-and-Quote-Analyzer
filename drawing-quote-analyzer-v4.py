@@ -169,108 +169,108 @@ def process_drawing_file(parsed_data):
     return unique_list
 
 def parse_crs_quote_from_text(text, filename):
-    """Parse CRS-style quote PDF. Quote Item column matches Drawing No. column"""
+    """Parse CRS-style quote PDF. Quote Item column matches Drawing No. column
+    Handles formats like:
+    - '2 1 ea WALK IN $97,980.27 $97,980.27'
+    - '4 1 ea WALK IN' (no price)
+    - '47 2 ea COMBI OVEN, ELECTRIC $41,165.40 $82,330.80'
+    """
     quotes = []
     lines = text.split('\n')
     
+    # Track current item being processed
     current_item = None
     current_qty = 0
     current_desc = ""
     current_unit_price = 0
     current_total_price = 0
     
-    # Regex patterns as raw strings
-    # Pattern: "2 1 ea WALK IN $97,980.27 $97,980.27"
-    pat_full = r'^(\d+[a-z]?)\s+(\d+)\s*ea\s+(.+?)\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s*$'
-    pat_single = r'^(\d+[a-z]?)\s+(\d+)\s*ea\s+(.+?)\s+\$?([\d,]+\.\d{2})\s*$'
-    pat_nopr = r'^(\d+[a-z]?)\s+(\d+)\s*ea\s+([A-Za-z][A-Za-z\s,\./&\-\(\)\']+)'
-    pat_nic = r'^(\d+[a-z]?)\s+NIC\b'
-    pat_total = r'ITEM\s*TOTAL[:\s]*\$?([\d,]+\.\d{2})'
-    
-    full_pattern = re.compile(pat_full, re.IGNORECASE)
-    single_price_pattern = re.compile(pat_single, re.IGNORECASE)
-    no_price_pattern = re.compile(pat_nopr, re.IGNORECASE)
-    nic_pattern = re.compile(pat_nic, re.IGNORECASE)
-    total_pattern = re.compile(pat_total, re.IGNORECASE)
-    
-    skip_keywords = ['page ', 'canadian restaurant', 'bird construc', 'fwg ltc', 'item qty description', 'sell total']
+    # Skip keywords in lines
+    skip_keywords = ['page ', 'canadian restaurant', 'bird construc', 'fwg ltc', 
+                     'item qty description', 'sell total', 'merchandise', 'gst', 
+                     'tax 7%', 'total $', 'prices are in']
     
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        if any(skip in line.lower() for skip in skip_keywords):
-            continue
-        if nic_pattern.match(line):
+        
+        # Skip header/footer lines
+        line_lower = line.lower()
+        if any(skip in line_lower for skip in skip_keywords):
             continue
         
-        # Try full pattern (both prices)
-        match = full_pattern.match(line)
-        if match:
-            if current_item and current_desc:
-                quotes.append({
-                    'Item': current_item, 'Description': current_desc.strip(), 'Qty': current_qty,
-                    'Unit_Price': current_unit_price,
-                    'Total_Price': current_total_price if current_total_price else current_unit_price * current_qty,
-                    'Source_File': filename
-                })
-            current_item = match.group(1)
-            current_qty = int(match.group(2))
-            current_desc = match.group(3).strip()
-            current_unit_price = float(match.group(4).replace(',', ''))
-            current_total_price = float(match.group(5).replace(',', ''))
+        # Check for NIC items - skip them (e.g., "1 NIC", "11-23 NIC", "25-36 NIC")
+        if re.match(r'^[\d\-]+[a-z]?\s+NIC\b', line, re.IGNORECASE):
             continue
         
-        # Try single price pattern
-        match = single_price_pattern.match(line)
-        if match:
-            if current_item and current_desc:
-                quotes.append({
-                    'Item': current_item, 'Description': current_desc.strip(), 'Qty': current_qty,
-                    'Unit_Price': current_unit_price,
-                    'Total_Price': current_total_price if current_total_price else current_unit_price * current_qty,
-                    'Source_File': filename
-                })
-            current_item = match.group(1)
-            current_qty = int(match.group(2))
-            current_desc = match.group(3).strip()
-            current_unit_price = float(match.group(4).replace(',', ''))
-            current_total_price = current_unit_price * current_qty
-            continue
-        
-        # Try no price pattern
-        match = no_price_pattern.match(line)
-        if match:
-            if current_item and current_desc:
-                quotes.append({
-                    'Item': current_item, 'Description': current_desc.strip(), 'Qty': current_qty,
-                    'Unit_Price': current_unit_price,
-                    'Total_Price': current_total_price if current_total_price else current_unit_price * current_qty,
-                    'Source_File': filename
-                })
-            current_item = match.group(1)
-            current_qty = int(match.group(2))
-            current_desc = match.group(3).strip()
-            current_unit_price = 0
-            current_total_price = 0
-            continue
-        
-        # Check for ITEM TOTAL line
-        total_match = total_pattern.search(line)
+        # Check for ITEM TOTAL line - capture the total price for current item
+        total_match = re.search(r'ITEM\s*TOTAL[:\s]*\$?([\d,]+\.\d{2})', line, re.IGNORECASE)
         if total_match and current_item:
             current_total_price = float(total_match.group(1).replace(',', ''))
-            if not current_unit_price:
-                current_unit_price = current_total_price / current_qty if current_qty else current_total_price
+            if not current_unit_price and current_qty > 0:
+                current_unit_price = current_total_price / current_qty
+            continue
+        
+        # Main pattern: Try to match item line
+        # Format: ITEM_NUM QTY ea DESCRIPTION [PRICE] [TOTAL]
+        # Examples: "2 1 ea WALK IN $97,980.27 $97,980.27"
+        #           "4 1 ea WALK IN"
+        #           "47 2 ea COMBI OVEN, ELECTRIC $41,165.40 $82,330.80"
+        
+        item_match = re.match(
+            r'^(\d+[a-z]?)\s+(\d+)\s*ea\s+([A-Z][A-Z0-9\s,\./&\-\(\)\']+)',
+            line, re.IGNORECASE
+        )
+        
+        if item_match:
+            # Save previous item if exists
+            if current_item and current_desc:
+                quotes.append({
+                    'Item': current_item,
+                    'Description': current_desc.strip(),
+                    'Qty': current_qty,
+                    'Unit_Price': current_unit_price,
+                    'Total_Price': current_total_price if current_total_price else current_unit_price * current_qty,
+                    'Source_File': filename
+                })
+            
+            # Start new item
+            current_item = item_match.group(1)
+            current_qty = int(item_match.group(2))
+            current_desc = item_match.group(3).strip()
+            current_unit_price = 0
+            current_total_price = 0
+            
+            # Try to extract prices from the same line
+            # Look for price patterns after the description
+            remaining = line[item_match.end():]
+            price_matches = re.findall(r'\$?([\d,]+\.\d{2})', remaining)
+            
+            if not price_matches:
+                # Also try to find prices in the original line after description
+                price_matches = re.findall(r'\$?([\d,]+\.\d{2})', line)
+            
+            if len(price_matches) >= 2:
+                current_unit_price = float(price_matches[-2].replace(',', ''))
+                current_total_price = float(price_matches[-1].replace(',', ''))
+            elif len(price_matches) == 1:
+                current_unit_price = float(price_matches[0].replace(',', ''))
+                current_total_price = current_unit_price * current_qty
+            
             continue
     
     # Save last item
     if current_item and current_desc:
         quotes.append({
-            'Item': current_item, 'Description': current_desc.strip(), 'Qty': current_qty,
+            'Item': current_item,
+            'Description': current_desc.strip(),
+            'Qty': current_qty,
             'Unit_Price': current_unit_price,
             'Total_Price': current_total_price if current_total_price else current_unit_price * current_qty,
             'Source_File': filename
         })
+    
     return quotes
 
 def extract_quotes_from_dataframe(df, filename):
@@ -340,32 +340,36 @@ def process_quote_file(parsed_data):
             extracted = extract_quotes_from_dataframe(df, parsed_data['filename'])
             if extracted:
                 quotes.extend(extracted)
+    # Remove duplicates - keep first occurrence of each Item
     seen_items = set()
     unique_quotes = []
     for q in quotes:
-        if q['Item'] not in seen_items:
-            seen_items.add(q['Item'])
+        item_key = q['Item']
+        if item_key and item_key not in seen_items:
+            seen_items.add(item_key)
             unique_quotes.append(q)
     return unique_quotes
 
 def match_quote_to_schedule(schedule_item, all_quotes):
-    drawing_no = str(schedule_item['No']).strip().lower()
-    desc = schedule_item['Description'].upper()
-    # PRIMARY: Exact match Drawing No. vs Quote Item
+    drawing_no = str(schedule_item['No']).strip()
+    # PRIMARY: Exact match Drawing No. vs Quote Item (case-insensitive)
     for quote in all_quotes:
-        quote_item = str(quote.get('Item', '')).strip().lower()
-        if drawing_no and quote_item and drawing_no == quote_item:
+        quote_item = str(quote.get('Item', '')).strip()
+        if drawing_no.lower() == quote_item.lower():
             return quote
-    # SECONDARY: Description matching
-    for quote in all_quotes:
-        quote_desc = quote['Description'].upper()
-        desc_words = set(re.findall(r'\b[A-Z]{3,}\b', desc))
-        quote_words = set(re.findall(r'\b[A-Z]{3,}\b', quote_desc))
-        common_words = desc_words & quote_words
-        if len(common_words) >= 2:
-            similarity = len(common_words) / max(len(desc_words), len(quote_words), 1)
-            if similarity > 0.3:
-                return quote
+    # SECONDARY: Try numeric match (e.g., "3" matches "3", "03" matches "3")
+    try:
+        drawing_no_int = int(re.sub(r'[a-zA-Z]', '', drawing_no))
+        for quote in all_quotes:
+            quote_item = str(quote.get('Item', '')).strip()
+            try:
+                quote_item_int = int(re.sub(r'[a-zA-Z]', '', quote_item))
+                if drawing_no_int == quote_item_int:
+                    return quote
+            except:
+                continue
+    except:
+        pass
     return None
 
 def analyze_schedule_vs_quotes(equipment_schedule, all_quotes):
@@ -450,7 +454,7 @@ with tabs[0]:
     
     with col2:
         st.subheader("📝 Upload Quotations")
-        st.info("Upload quotations. 'Item' column matches Drawing 'No.' column.")
+        st.info("Upload quotations (CRS format). 'Item' column matches Drawing 'No.'")
         quote_files = st.file_uploader("Select Quote Files", type=['pdf', 'csv', 'xlsx', 'xls'], key="quote_upload", accept_multiple_files=True)
         if quote_files:
             for quote_file in quote_files:
@@ -599,4 +603,4 @@ with tabs[4]:
                     st.text(text)
 
 st.markdown("---")
-st.markdown('<div style="text-align:center;color:#666;padding:20px;"><p>Equipment Quote Analyzer v5.4 | Built for Bird Construction</p><p>Matching: Drawing "No." ↔ Quote "Item"</p></div>', unsafe_allow_html=True)
+st.markdown('<div style="text-align:center;color:#666;padding:20px;"><p>Equipment Quote Analyzer v5.5 | Built for Bird Construction</p><p>Matching: Drawing "No." ↔ Quote "Item"</p></div>', unsafe_allow_html=True)
