@@ -399,7 +399,7 @@ def analyze_schedule_vs_quotes(equipment_schedule, all_quotes):
 
 # ==================== MAIN UI ====================
 
-st.markdown('<p class="main-header">🍳 Kitchen Equipment Quote Analyzer</p>', unsafe_allow_html=True)
+st.markdown('<p class="main-header">🔍 Equipment Quote Analyzer</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-header">Upload drawings and quotations (PDF, CSV, XLSX) for analysis</p>', unsafe_allow_html=True)
 
 if not PDF_SUPPORT:
