@@ -13,7 +13,7 @@ try:
 except ImportError:
     PDF_SUPPORT = False
 
-st.set_page_config(page_title="Drawing vs Quote Analyzer", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="Drawing Quote Analyzer", page_icon="🔍", layout="wide")
 
 st.markdown("""
 <style>
@@ -21,10 +21,8 @@ st.markdown("""
     .sub-header { font-size: 1.2rem; color: #666; }
     div[data-testid="stMetricValue"] { font-size: 1.8rem; }
     .upload-section { background-color: #f8f9fa; padding: 20px; border-radius: 10px; margin: 10px 0; }
-    .file-info { background-color: #e7f3ff; padding: 10px; border-radius: 5px; margin: 5px 0; }
     .success-box { background-color: #d4edda; padding: 15px; border-radius: 5px; border-left: 4px solid #28a745; }
     .warning-box { background-color: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107; }
-    .error-box { background-color: #f8d7da; padding: 15px; border-radius: 5px; border-left: 4px solid #dc3545; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -58,6 +56,7 @@ def parse_pdf_file(uploaded_file):
     text_content = []
     all_tables = []
     
+    uploaded_file.seek(0)
     with pdfplumber.open(uploaded_file) as pdf:
         for page_num, page in enumerate(pdf.pages):
             text = page.extract_text()
@@ -67,9 +66,12 @@ def parse_pdf_file(uploaded_file):
             tables = page.extract_tables()
             for table in tables:
                 if table and len(table) > 1:
-                    df = pd.DataFrame(table[1:], columns=table[0] if table[0] else None)
-                    df['_source_page'] = page_num + 1
-                    all_tables.append(df)
+                    try:
+                        df = pd.DataFrame(table[1:], columns=table[0] if table[0] else None)
+                        df['_source_page'] = page_num + 1
+                        all_tables.append(df)
+                    except:
+                        pass
     
     combined_text = "\n".join(text_content)
     return combined_text, all_tables
@@ -77,6 +79,7 @@ def parse_pdf_file(uploaded_file):
 def parse_excel_file(uploaded_file):
     """Parse Excel file (xlsx/xls)"""
     try:
+        uploaded_file.seek(0)
         xl = pd.ExcelFile(uploaded_file)
         all_sheets = {}
         for sheet_name in xl.sheet_names:
@@ -90,6 +93,7 @@ def parse_excel_file(uploaded_file):
 def parse_csv_file(uploaded_file):
     """Parse CSV file"""
     try:
+        uploaded_file.seek(0)
         df = pd.read_csv(uploaded_file)
         return {"Sheet1": df}
     except Exception as e:
@@ -119,7 +123,6 @@ def extract_equipment_from_pdf_text(text):
     """Extract equipment items from PDF text using pattern matching"""
     equipment_list = []
     
-    # Pattern to match equipment items (Item#, Description, Qty, Category)
     patterns = [
         r'(\d+[a-z]?)\s+([A-Z][A-Z\s\./&\-\(\)]+?)\s+(\d+)\s+(\d+)',
         r'(\d+[a-z]?)\s+([\w\s\./&\-\(\)]+?)\s+(\d+)\s*$',
@@ -233,7 +236,141 @@ def process_drawing_file(parsed_data):
     
     return unique_list
 
-# ==================== QUOTE EXTRACTION ====================
+# ==================== QUOTE EXTRACTION (UPDATED FOR CRS FORMAT) ====================
+
+def parse_crs_quote_from_text(text, filename):
+    """Parse CRS-style quote from PDF text - handles format like '24 1 ea INGREDIENT BIN $386.48'"""
+    quotes = []
+    lines = text.split('\n')
+    
+    current_item = None
+    current_qty = 0
+    current_desc = ""
+    current_unit_price = 0
+    current_total_price = 0
+    
+    # Pattern for main item line: Item# Qty ea DESCRIPTION $Price $Total
+    # Examples: "2 1 ea WALK IN $97,980.27 $97,980.27"
+    #           "24 1 ea INGREDIENT BIN $386.48 $386.48"
+    #           "47 2 ea COMBI OVEN, ELECTRIC $41,165.40"
+    main_pattern = re.compile(
+        r'^(\d+[a-z]?)\s+(\d+)\s*ea\s+([A-Z][A-Z\s,\./&\-\(\)\']+?)\s+\$?([\d,]+\.?\d*)\s*(?:\$?([\d,]+\.?\d*))?',
+        re.IGNORECASE
+    )
+    
+    # Alternative pattern: Item# Qty ea DESCRIPTION (price on next line or no price shown)
+    alt_pattern = re.compile(
+        r'^(\d+[a-z]?)\s+(\d+)\s*ea\s+([A-Z][A-Z\s,\./&\-\(\)\']+)',
+        re.IGNORECASE
+    )
+    
+    # Pattern for ITEM TOTAL line
+    total_pattern = re.compile(r'ITEM\s*TOTAL:\s*\$?([\d,]+\.?\d*)', re.IGNORECASE)
+    
+    # Pattern for price at end of line
+    price_pattern = re.compile(r'\$?([\d,]+\.?\d{2})\s*$')
+    
+    # Pattern for NIC items (Not In Contract)
+    nic_pattern = re.compile(r'^(\d+(?:-\d+)?[a-z]?)\s+NIC', re.IGNORECASE)
+    
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Skip NIC items
+        if nic_pattern.match(line):
+            continue
+        
+        # Skip header/footer lines
+        if any(skip in line.lower() for skip in ['page ', 'canadian restaurant', 'bird construc', 'fwg ltc']):
+            continue
+        
+        # Try main pattern first
+        match = main_pattern.match(line)
+        if match:
+            # Save previous item if exists
+            if current_item and current_desc:
+                quotes.append({
+                    'Item': current_item,
+                    'Description': current_desc.strip(),
+                    'Qty': current_qty,
+                    'Unit_Price': current_unit_price,
+                    'Total_Price': current_total_price if current_total_price else current_unit_price * current_qty,
+                    'Source_File': filename
+                })
+            
+            current_item = match.group(1)
+            current_qty = int(match.group(2))
+            current_desc = match.group(3).strip()
+            
+            # Parse prices
+            price1 = match.group(4).replace(',', '')
+            current_unit_price = float(price1) if price1 else 0
+            
+            if match.group(5):
+                price2 = match.group(5).replace(',', '')
+                current_total_price = float(price2) if price2 else current_unit_price * current_qty
+            else:
+                current_total_price = current_unit_price * current_qty
+            
+            continue
+        
+        # Try alternative pattern (no price on same line)
+        alt_match = alt_pattern.match(line)
+        if alt_match:
+            # Save previous item if exists
+            if current_item and current_desc:
+                quotes.append({
+                    'Item': current_item,
+                    'Description': current_desc.strip(),
+                    'Qty': current_qty,
+                    'Unit_Price': current_unit_price,
+                    'Total_Price': current_total_price if current_total_price else current_unit_price * current_qty,
+                    'Source_File': filename
+                })
+            
+            current_item = alt_match.group(1)
+            current_qty = int(alt_match.group(2))
+            current_desc = alt_match.group(3).strip()
+            current_unit_price = 0
+            current_total_price = 0
+            
+            # Check for price at end of line
+            price_match = price_pattern.search(line)
+            if price_match:
+                current_unit_price = float(price_match.group(1).replace(',', ''))
+                current_total_price = current_unit_price * current_qty
+            
+            continue
+        
+        # Check for ITEM TOTAL line
+        total_match = total_pattern.search(line)
+        if total_match and current_item:
+            current_total_price = float(total_match.group(1).replace(',', ''))
+            continue
+        
+        # Check for standalone price line
+        if current_item and not current_total_price:
+            price_match = price_pattern.search(line)
+            if price_match and not any(c.isalpha() for c in line.replace('ITEM TOTAL:', '')):
+                price_val = float(price_match.group(1).replace(',', ''))
+                if not current_unit_price:
+                    current_unit_price = price_val
+                current_total_price = price_val
+    
+    # Don't forget the last item
+    if current_item and current_desc:
+        quotes.append({
+            'Item': current_item,
+            'Description': current_desc.strip(),
+            'Qty': current_qty,
+            'Unit_Price': current_unit_price,
+            'Total_Price': current_total_price if current_total_price else current_unit_price * current_qty,
+            'Source_File': filename
+        })
+    
+    return quotes
 
 def extract_quotes_from_dataframe(df, filename):
     """Extract quote items from a DataFrame"""
@@ -245,8 +382,8 @@ def extract_quotes_from_dataframe(df, filename):
         'item': ['item', 'item #', 'item#', 'no', 'no.', 'line', 'ref'],
         'description': ['description', 'desc', 'equipment', 'name', 'product'],
         'qty': ['qty', 'quantity', 'qnty', 'count', 'units'],
-        'unit_price': ['unit price', 'unit', 'price', 'unit cost', 'each'],
-        'total_price': ['total', 'total price', 'ext price', 'extended', 'amount', 'ext']
+        'unit_price': ['unit price', 'unit', 'price', 'unit cost', 'each', 'sell'],
+        'total_price': ['total', 'total price', 'ext price', 'extended', 'amount', 'ext', 'sell total']
     }
     
     found_cols = {}
@@ -260,26 +397,30 @@ def extract_quotes_from_dataframe(df, filename):
     for _, row in df.iterrows():
         try:
             desc_val = str(row.get(found_cols.get('description', ''), '')).strip()
-            if not desc_val or desc_val.lower() in ['nan', '', 'none', 'description']:
+            if not desc_val or desc_val.lower() in ['nan', '', 'none', 'description', 'nic']:
                 continue
             
             item_val = str(row.get(found_cols.get('item', ''), '')).strip()
             
             qty_val = row.get(found_cols.get('qty', ''), 1)
+            # Handle "X ea" format
+            qty_str = str(qty_val).lower().replace('ea', '').strip()
             try:
-                qty_val = int(float(str(qty_val).replace(',', ''))) if pd.notna(qty_val) else 1
+                qty_val = int(float(qty_str.replace(',', ''))) if pd.notna(qty_val) and qty_str else 1
             except:
                 qty_val = 1
             
             unit_price = row.get(found_cols.get('unit_price', ''), 0)
             try:
-                unit_price = float(str(unit_price).replace('$', '').replace(',', '')) if pd.notna(unit_price) else 0
+                unit_str = str(unit_price).replace('$', '').replace(',', '').strip()
+                unit_price = float(unit_str) if pd.notna(unit_price) and unit_str else 0
             except:
                 unit_price = 0
             
             total_price = row.get(found_cols.get('total_price', ''), 0)
             try:
-                total_price = float(str(total_price).replace('$', '').replace(',', '')) if pd.notna(total_price) else 0
+                total_str = str(total_price).replace('$', '').replace(',', '').strip()
+                total_price = float(total_str) if pd.notna(total_price) and total_str else 0
             except:
                 total_price = unit_price * qty_val if unit_price else 0
             
@@ -301,7 +442,12 @@ def process_quote_file(parsed_data):
     quotes = []
     
     if parsed_data['type'] == 'pdf':
-        if parsed_data['tables']:
+        # First try to extract from text (CRS format)
+        if parsed_data['text']:
+            quotes = parse_crs_quote_from_text(parsed_data['text'], parsed_data['filename'])
+        
+        # If no quotes found from text, try tables
+        if not quotes and parsed_data['tables']:
             for table_df in parsed_data['tables']:
                 extracted = extract_quotes_from_dataframe(table_df, parsed_data['filename'])
                 if extracted:
@@ -313,29 +459,42 @@ def process_quote_file(parsed_data):
             if extracted:
                 quotes.extend(extracted)
     
-    return quotes
+    # Remove duplicates based on Item number
+    seen_items = set()
+    unique_quotes = []
+    for q in quotes:
+        if q['Item'] not in seen_items:
+            seen_items.add(q['Item'])
+            unique_quotes.append(q)
+    
+    return unique_quotes
 
 # ==================== ANALYSIS FUNCTIONS ====================
 
 def match_quote_to_schedule(schedule_item, all_quotes):
     """Find matching quote for a schedule item using fuzzy matching"""
-    item_num = str(schedule_item['Item']).strip()
+    item_num = str(schedule_item['Item']).strip().lower()
     desc = schedule_item['Description'].upper()
     
+    # First try exact item number match
     for quote in all_quotes:
-        quote_item = str(quote.get('Item', '')).strip()
-        quote_desc = quote['Description'].upper()
-        
+        quote_item = str(quote.get('Item', '')).strip().lower()
         if item_num and quote_item and item_num == quote_item:
             return quote
+    
+    # Then try description matching
+    for quote in all_quotes:
+        quote_desc = quote['Description'].upper()
         
-        desc_words = set(desc.split())
-        quote_words = set(quote_desc.split())
+        # Get key words from descriptions
+        desc_words = set(re.findall(r'\b[A-Z]{3,}\b', desc))
+        quote_words = set(re.findall(r'\b[A-Z]{3,}\b', quote_desc))
+        
         common_words = desc_words & quote_words
         
         if len(common_words) >= 2:
-            similarity = len(common_words) / max(len(desc_words), len(quote_words))
-            if similarity > 0.4:
+            similarity = len(common_words) / max(len(desc_words), len(quote_words), 1)
+            if similarity > 0.3:
                 return quote
     
     return None
@@ -399,11 +558,17 @@ def analyze_schedule_vs_quotes(equipment_schedule, all_quotes):
 
 # ==================== MAIN UI ====================
 
-st.markdown('<p class="main-header">🔍 Equipment Quote Analyzer</p>', unsafe_allow_html=True)
+st.markdown('<p class="main-header"> 🔍 Equipment Quote Analyzer</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-header">Upload drawings and quotations (PDF, CSV, XLSX) for analysis</p>', unsafe_allow_html=True)
 
 if not PDF_SUPPORT:
-    st.warning("⚠️ PDF support not installed. Run `pip install pdfplumber` to enable PDF uploads.")
+    st.warning("""
+    ⚠️ **PDF support not installed.** To enable PDF uploads, run:
+    ```
+    pip install pdfplumber
+    ```
+    **Alternative:** Convert your PDFs to CSV or XLSX format.
+    """)
 
 st.markdown("---")
 
@@ -421,8 +586,7 @@ with tabs[0]:
         drawing_file = st.file_uploader(
             "Select Drawing File",
             type=['pdf', 'csv', 'xlsx', 'xls'],
-            key="drawing_upload",
-            help="Upload the kitchen equipment schedule/drawings"
+            key="drawing_upload"
         )
         
         if drawing_file:
@@ -439,21 +603,20 @@ with tabs[0]:
                             preview_df = pd.DataFrame(equipment)
                             st.dataframe(preview_df, use_container_width=True, height=300)
                     else:
-                        st.error("Could not extract equipment schedule. Please check file format.")
+                        st.error("Could not extract equipment schedule. Please ensure the file has Item, Description, Qty columns.")
         
         if st.session_state.equipment_schedule:
             st.markdown(f"**Current Schedule:** {st.session_state.drawing_filename} ({len(st.session_state.equipment_schedule)} items)")
     
     with col2:
         st.subheader("📝 Upload Quotations")
-        st.info("Upload one or more quotation files. Supported formats: PDF, CSV, XLSX")
+        st.info("Upload one or more quotation files (CRS format supported). Supported formats: PDF, CSV, XLSX")
         
         quote_files = st.file_uploader(
             "Select Quote Files",
             type=['pdf', 'csv', 'xlsx', 'xls'],
             key="quote_upload",
-            accept_multiple_files=True,
-            help="Upload vendor quotations"
+            accept_multiple_files=True
         )
         
         if quote_files:
@@ -466,13 +629,19 @@ with tabs[0]:
                             if quotes:
                                 st.session_state.quotes_data[quote_file.name] = quotes
                                 st.success(f"✅ Extracted {len(quotes)} items from {quote_file.name}")
+                                
+                                # Show preview of extracted quotes
+                                with st.expander(f"Preview: {quote_file.name}", expanded=False):
+                                    preview_df = pd.DataFrame(quotes)
+                                    st.dataframe(preview_df, use_container_width=True, height=200)
                             else:
                                 st.warning(f"⚠️ No quote items found in {quote_file.name}")
         
         if st.session_state.quotes_data:
             st.markdown("**Loaded Quotations:**")
             for fname, quotes in st.session_state.quotes_data.items():
-                st.markdown(f"- {fname}: {len(quotes)} items")
+                total_value = sum(q.get('Total_Price', 0) for q in quotes)
+                st.markdown(f"- {fname}: {len(quotes)} items (${total_value:,.2f})")
             
             if st.button("🗑️ Clear All Quotes"):
                 st.session_state.quotes_data = {}
@@ -480,13 +649,11 @@ with tabs[0]:
 
     st.markdown("---")
     
-    col_clear1, col_clear2 = st.columns(2)
-    with col_clear1:
-        if st.button("🔄 Reset All Data"):
-            st.session_state.equipment_schedule = None
-            st.session_state.quotes_data = {}
-            st.session_state.drawing_filename = None
-            st.rerun()
+    if st.button("🔄 Reset All Data"):
+        st.session_state.equipment_schedule = None
+        st.session_state.quotes_data = {}
+        st.session_state.drawing_filename = None
+        st.rerun()
 
 # ==================== TAB 2: ANALYSIS DASHBOARD ====================
 with tabs[1]:
@@ -677,12 +844,20 @@ with tabs[4]:
         )
     else:
         st.warning("⚠️ Please upload drawing and quotation files first.")
+    
+    # Show extracted quotes for debugging
+    if st.session_state.quotes_data:
+        st.markdown("---")
+        st.subheader("📄 Extracted Quote Data (Debug View)")
+        for fname, quotes in st.session_state.quotes_data.items():
+            with st.expander(f"{fname} - {len(quotes)} items"):
+                st.dataframe(pd.DataFrame(quotes), use_container_width=True)
 
 # Footer
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666; padding: 20px;'>
-    <p>Kitchen Equipment Quote Analyzer v5.0 | Built for Bird Construction</p>
-    <p>Supported Formats: PDF, CSV, XLSX</p>
+    <p>Kitchen Equipment Quote Analyzer v5.1 | Built for Bird Construction</p>
+    <p>Supported Formats: PDF (CRS format), CSV, XLSX</p>
 </div>
 """, unsafe_allow_html=True)
