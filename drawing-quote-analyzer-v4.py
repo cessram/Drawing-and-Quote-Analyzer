@@ -76,61 +76,213 @@ def parse_uploaded_file(uploaded_file):
         text, tables = parse_pdf_file(uploaded_file)
         return {'type': 'pdf', 'text': text, 'tables': tables, 'filename': uploaded_file.name}
     elif ext in ['xlsx', 'xls']:
-        return {'type': 'excel', 'sheets': parse_excel_file(uploaded_file), 'filename': uploaded_file.name}
+        sheets = parse_excel_file(uploaded_file)
+        return {'type': 'excel', 'sheets': sheets, 'filename': uploaded_file.name}
     elif ext == 'csv':
-        return {'type': 'csv', 'sheets': parse_csv_file(uploaded_file), 'filename': uploaded_file.name}
+        sheets = parse_csv_file(uploaded_file)
+        return {'type': 'csv', 'sheets': sheets, 'filename': uploaded_file.name}
     return None
 
-def extract_equipment_from_dataframe(df):
+def show_file_preview(parsed_data):
+    """Show a preview of the file structure to help with debugging"""
+    if parsed_data['type'] == 'pdf':
+        if parsed_data['tables']:
+            st.write(f"**PDF has {len(parsed_data['tables'])} table(s)**")
+            for i, tbl in enumerate(parsed_data['tables']):
+                st.write(f"Table {i+1} columns: {tbl.columns.tolist()}")
+                st.dataframe(tbl.head(5), height=150)
+        else:
+            st.warning("No tables found in PDF")
+    elif parsed_data['type'] in ['excel', 'csv']:
+        if parsed_data.get('sheets'):
+            for name, df in parsed_data['sheets'].items():
+                st.write(f"**Sheet '{name}'** - Columns: {df.columns.tolist()}")
+                st.dataframe(df.head(5), height=150)
+
+def extract_equipment_from_dataframe(df, debug=False):
+    """Extract equipment items from a dataframe with flexible column detection"""
     equipment_list = []
+    original_cols = df.columns.tolist()
+    
+    # Clean up the dataframe - remove completely empty rows
+    df = df.dropna(how='all').reset_index(drop=True)
+    
+    # Normalize column names
     df.columns = df.columns.astype(str).str.strip().str.lower()
+    
+    if debug:
+        st.write("**Original columns:**", original_cols)
+        st.write("**Normalized columns:**", df.columns.tolist())
+        st.write("**DataFrame shape:**", df.shape)
+    
+    # Extended column mapping with more variations
     col_map = {
-        'no': ['no', 'no.', 'item', 'item #', 'item no', 'number'],
-        'description': ['description', 'desc', 'equipment', 'name'],
-        'qty': ['qty', 'quantity', 'count'],
-        'category': ['category', 'cat', 'supplier code', 'code']
+        'no': ['no', 'no.', 'item', 'item #', 'item no', 'item no.', 'number', '#', 
+               'eq no', 'eq no.', 'equipment no', 'equipment no.', 'equip no', 
+               'equip no.', 'id', 'ref', 'ref.', 'reference', 'tag', 'tag no', 'tag no.'],
+        'description': ['description', 'desc', 'equipment', 'name', 'item description', 
+                       'equipment description', 'equip desc', 'equipment name', 
+                       'item name', 'remarks', 'details'],
+        'qty': ['qty', 'quantity', 'count', 'qnty', 'qty.', 'amount', 'units', 'ea'],
+        'category': ['category', 'cat', 'supplier code', 'code', 'supplier', 'type', 
+                    'supply', 'source', 'cat.', 'supplier cat']
     }
+    
     found = {}
+    
+    # First pass: exact match
     for key, opts in col_map.items():
         for col in df.columns:
-            if any(o == col.lower().strip() for o in opts):
+            col_clean = col.lower().strip()
+            if col_clean in opts:
                 found[key] = col
                 break
+    
+    # Second pass: partial match for unfound columns
+    for key, opts in col_map.items():
+        if key not in found:
+            for col in df.columns:
+                col_clean = col.lower().strip()
+                if any(o in col_clean for o in opts):
+                    found[key] = col
+                    break
+    
+    if debug:
+        st.write("**Found column mapping:**", found)
+    
+    # Fallback: try using first columns if standard mapping failed
     if 'no' not in found or 'description' not in found:
+        if len(df.columns) >= 2:
+            first_col = df.columns[0]
+            second_col = df.columns[1]
+            
+            if debug:
+                st.write(f"**Trying fallback:** First col '{first_col}' as No, Second col '{second_col}' as Description")
+            
+            # Check if first column looks like item numbers (e.g., "1", "1a", "23", etc.)
+            sample_vals = df[first_col].dropna().head(10).astype(str).tolist()
+            looks_like_numbers = any(
+                re.match(r'^\d+[a-zA-Z]?$', str(v).strip()) 
+                for v in sample_vals if str(v).strip()
+            )
+            
+            if looks_like_numbers:
+                if 'no' not in found:
+                    found['no'] = first_col
+                if 'description' not in found:
+                    found['description'] = second_col
+                if debug:
+                    st.write("**Fallback accepted** - first column contains item numbers")
+            elif debug:
+                st.write("**Fallback rejected** - first column doesn't look like item numbers")
+                st.write("Sample values:", sample_vals[:5])
+    
+    # Additional fallback: check for any column that looks like it contains item numbers
+    if 'no' not in found:
+        for col in df.columns:
+            sample = df[col].dropna().head(10).astype(str).tolist()
+            if any(re.match(r'^\d+[a-zA-Z]?$', str(v).strip()) for v in sample if str(v).strip()):
+                found['no'] = col
+                if debug:
+                    st.write(f"**Auto-detected 'no' column:** {col}")
+                break
+    
+    # Check for description in remaining columns
+    if 'description' not in found and 'no' in found:
+        for col in df.columns:
+            if col != found['no']:
+                # Check if column has text content (longer strings)
+                sample = df[col].dropna().head(10).astype(str).tolist()
+                avg_len = sum(len(str(v)) for v in sample) / max(len(sample), 1)
+                if avg_len > 10:  # Descriptions are usually longer
+                    found['description'] = col
+                    if debug:
+                        st.write(f"**Auto-detected 'description' column:** {col}")
+                    break
+    
+    if 'no' not in found or 'description' not in found:
+        if debug:
+            st.error(f"Missing required columns. Found mapping: {found}")
+            st.info("Need columns for: Item Number (no) and Description")
         return None
-    for _, row in df.iterrows():
+    
+    # Extract equipment items
+    for idx, row in df.iterrows():
         try:
             no = str(row.get(found.get('no', ''), '')).strip()
             desc = str(row.get(found.get('description', ''), '')).strip()
-            if not no or no.lower() in ['nan', ''] or not desc or desc.lower() in ['nan', '']:
+            
+            # Skip empty/invalid rows
+            if not no or no.lower() in ['nan', '', 'none', 'no', 'no.', 'item', 'item no', 'item no.']:
                 continue
+            if not desc or desc.lower() in ['nan', '', 'none', 'description', 'desc']:
+                continue
+            
+            # Skip header-like rows
+            if no.lower() == found.get('no', '').lower():
+                continue
+            
             qty = 1
-            try:
-                qty = int(float(str(row.get(found.get('qty', ''), 1)).replace(',', '')))
-            except:
-                pass
+            if 'qty' in found:
+                try:
+                    qval = str(row.get(found['qty'], 1)).replace(',', '').strip()
+                    qval = re.sub(r'[^\d.]', '', qval)  # Remove non-numeric chars
+                    qty = int(float(qval)) if qval and qval.lower() not in ['nan', ''] else 1
+                except:
+                    pass
+            
             cat = None
-            try:
-                cat = int(float(str(row.get(found.get('category', ''), ''))))
-            except:
-                pass
+            if 'category' in found:
+                try:
+                    cval = str(row.get(found['category'], '')).strip()
+                    cval = re.sub(r'[^\d]', '', cval)  # Extract only digits
+                    cat = int(float(cval)) if cval else None
+                except:
+                    pass
+            
             equipment_list.append({'No': no, 'Description': desc, 'Qty': qty, 'Category': cat})
-        except:
+        except Exception as e:
+            if debug:
+                st.write(f"Row {idx} error: {e}")
             continue
+    
+    if debug:
+        st.write(f"**Extracted {len(equipment_list)} items**")
+        if equipment_list:
+            st.write("**Sample items:**")
+            for item in equipment_list[:3]:
+                st.write(f"  - {item}")
+    
     return equipment_list if equipment_list else None
 
-def process_drawing_file(parsed_data):
+def process_drawing_file(parsed_data, debug=False):
+    """Process drawing file and extract equipment list"""
     equipment_list = []
+    
     if parsed_data['type'] == 'pdf' and parsed_data['tables']:
-        for tbl in parsed_data['tables']:
-            ext = extract_equipment_from_dataframe(tbl)
+        if debug:
+            st.write(f"**PDF Tables found:** {len(parsed_data['tables'])}")
+        for i, tbl in enumerate(parsed_data['tables']):
+            if debug:
+                st.write(f"**Processing Table {i+1}:**")
+            ext = extract_equipment_from_dataframe(tbl, debug=debug)
             if ext:
                 equipment_list.extend(ext)
+                
     elif parsed_data['type'] in ['excel', 'csv'] and parsed_data.get('sheets'):
-        for df in parsed_data['sheets'].values():
-            ext = extract_equipment_from_dataframe(df)
+        if debug:
+            st.write(f"**Sheets found:** {list(parsed_data['sheets'].keys())}")
+        for name, df in parsed_data['sheets'].items():
+            if debug:
+                st.write(f"**Processing Sheet '{name}':**")
+            ext = extract_equipment_from_dataframe(df, debug=debug)
             if ext:
                 equipment_list.extend(ext)
+    
+    if debug and not equipment_list:
+        st.warning("No equipment extracted from any table/sheet")
+    
+    # Remove duplicates
     seen = set()
     unique = []
     for item in equipment_list:
@@ -138,6 +290,7 @@ def process_drawing_file(parsed_data):
         if key not in seen:
             seen.add(key)
             unique.append(item)
+    
     return unique
 
 def parse_crs_quote_from_text(text, filename):
@@ -332,7 +485,7 @@ def analyze_schedule_vs_quotes(schedule, quotes):
         })
     return pd.DataFrame(analysis)
 
-# UI
+# ==================== UI ====================
 st.markdown("## 🔍 Equipment Quote Analyzer")
 st.markdown("Upload drawings and quotations for analysis")
 
@@ -346,6 +499,9 @@ with tabs[0]:
     with c1:
         st.subheader("📐 Drawing / Equipment Schedule")
         
+        # Debug mode toggle
+        debug_mode = st.checkbox("🔧 Debug Mode (show column detection)", key="debug_draw")
+        
         # Show current status
         if st.session_state.equipment_schedule and len(st.session_state.equipment_schedule) > 0:
             st.success(f"✅ Loaded: {st.session_state.drawing_filename} ({len(st.session_state.equipment_schedule)} items)")
@@ -357,14 +513,32 @@ with tabs[0]:
             with st.spinner("Processing drawing..."):
                 parsed = parse_uploaded_file(df_file)
                 if parsed:
-                    equip = process_drawing_file(parsed)
+                    # Always show preview in debug mode
+                    if debug_mode:
+                        st.write(f"**File type:** {parsed['type']}")
+                        with st.expander("📋 Raw File Preview", expanded=True):
+                            show_file_preview(parsed)
+                    
+                    equip = process_drawing_file(parsed, debug=debug_mode)
                     if equip and len(equip) > 0:
                         st.session_state.equipment_schedule = equip
                         st.session_state.drawing_filename = df_file.name
                         st.success(f"✅ Extracted {len(equip)} items from {df_file.name}")
-                        st.rerun()
+                        if not debug_mode:
+                            st.rerun()
                     else:
-                        st.error("❌ Could not extract equipment. Check file has 'No.' and 'Description' columns.")
+                        st.error("❌ Could not extract equipment.")
+                        st.info("""
+**Tips to fix this:**
+1. Enable **Debug Mode** above to see what columns were detected
+2. Your file needs columns similar to: `No.` or `Item` AND `Description`
+3. Check that your data starts from row 1 (or has a header row)
+4. Try exporting your drawing schedule to CSV/Excel format
+                        """)
+                        # Show preview anyway to help debug
+                        if not debug_mode:
+                            with st.expander("📋 Click to see file structure"):
+                                show_file_preview(parsed)
                 else:
                     st.error("❌ Could not parse file.")
     
@@ -407,7 +581,6 @@ with tabs[0]:
             st.session_state.drawing_filename = None
             st.rerun()
     with col2:
-        # Debug info
         with st.expander("🔧 Debug Info"):
             st.write(f"Equipment loaded: {st.session_state.equipment_schedule is not None and len(st.session_state.equipment_schedule) > 0 if st.session_state.equipment_schedule else False}")
             st.write(f"Equipment count: {len(st.session_state.equipment_schedule) if st.session_state.equipment_schedule else 0}")
@@ -499,4 +672,4 @@ with tabs[4]:
                     st.text(p.extract_text())
 
 st.markdown("---")
-st.markdown("<center>Equipment Quote Analyzer v5.7 | Drawing No. ↔ Quote Item</center>", unsafe_allow_html=True)
+st.markdown("<center>Equipment Quote Analyzer v5.9 | Drawing No. ↔ Quote Item</center>", unsafe_allow_html=True)
