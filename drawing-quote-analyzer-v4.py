@@ -86,15 +86,13 @@ def parse_uploaded_file(uploaded_file):
 def show_file_preview(parsed_data):
     if parsed_data['type'] == 'pdf':
         if parsed_data.get('text'):
-            st.write("**PDF Text Preview (first 2000 chars):**")
-            st.text(parsed_data['text'][:2000])
+            st.write("**PDF Text Preview (first 3000 chars):**")
+            st.text(parsed_data['text'][:3000])
         if parsed_data['tables']:
             st.write(f"**PDF has {len(parsed_data['tables'])} table(s)**")
             for i, tbl in enumerate(parsed_data['tables']):
                 st.write(f"Table {i+1} columns: {tbl.columns.tolist()}")
                 st.dataframe(tbl.head(5), height=150)
-        else:
-            st.warning("No tables found in PDF")
     elif parsed_data['type'] in ['excel', 'csv']:
         if parsed_data.get('sheets'):
             for name, df in parsed_data['sheets'].items():
@@ -102,34 +100,32 @@ def show_file_preview(parsed_data):
                 st.dataframe(df.head(5), height=150)
 
 def parse_equipment_from_text(text, debug=False):
-    """Parse equipment schedule from PDF text - handles Zeidler/FWG format"""
+    """
+    Parse equipment schedule from PDF text - handles Zeidler/FWG format
+    Columns: No. | NEW EQUIPMENT NUMBER | Description | Qty. | CATEGORY | [electrical specs...]
+    """
     equipment_list = []
     lines = text.split('\n')
     
     if debug:
         st.write(f"**Total lines in PDF:** {len(lines)}")
     
-    # Pattern for equipment lines: starts with item number, has description, qty, category
-    # Format: No | EquipNum(optional) | Description | Qty | Category | ... electrical specs
-    # Examples:
-    # "1 9038 STORAGE SHELVING 3 1"
-    # "2 1195.12 WALK-IN FREEZER c/w INSULATED FLOOR 1 5 12A 120V..."
-    # "3 WALK-IN FREEZER EVAPORATOR COIL 1 5 14A 208V..."
-    
-    # Skip lines that are clearly not equipment
+    # Skip patterns - headers, notes, etc.
     skip_patterns = [
         r'^EQUIPMENT LIST', r'^CATEGORY', r'^ELECTRICAL', r'^MECHANICAL',
         r'^No\.\s', r'^NEW\s', r'^Description', r'^Load', r'^Volts',
         r'^WATER', r'^WASTE', r'^GAS', r'^EXHAUST', r'^HW', r'^CW',
-        r'^E\d+\s', r'^M\d+\s',  # Notes like E1, M1
-        r'^NOTE:', r'^SUPPLIER CODE', r'^\d+\s+IH SUPPLY', r'^\d+\s+CONTRACTOR',
+        r'^E\d+\s', r'^M\d+\s', r'^NOTE:', r'^SUPPLIER CODE',
+        r'^\d+\s+IH SUPPLY', r'^\d+\s+CONTRACTOR', r'^\d+\s+EXISTING',
         r'^PROJECT', r'^TITLE', r'^DRAWING', r'^REVISION', r'^zeidler',
         r'^COPYRIGHT', r'^300,', r'^T 403', r'^Zeidler', r'^Interior Health',
         r'^ISSUED', r'^DATE', r'Autodesk Docs', r'^\s*$',
         r'^KITCHEN EQUIPMENT', r'^1 : \d+', r'^K-\d+',
         r'^THIS PLAN', r'^ALL SERVICES', r'^ELECTRICAL CONTRACTOR',
         r'^MECHANICAL CONTRACTOR', r'^KITCHEN CONTRACTOR',
-        r'^UPON COMPLETION', r'^AT THIS POINT'
+        r'^UPON COMPLETION', r'^AT THIS POINT', r'^PROJECT ADDRESS',
+        r'^Elec\. RI', r'^Height', r'^Direct', r'^Indirect',
+        r'^Conn\. Type', r'^Ph\.', r'^Load\s+MBH'
     ]
     
     for line in lines:
@@ -146,11 +142,7 @@ def parse_equipment_from_text(text, debug=False):
         if skip:
             continue
         
-        # Try to match equipment line pattern
-        # Pattern 1: No + EquipNum + Description + ... + Qty + Category (at specific positions)
-        # Pattern 2: No + Description (no equip num) + ... + Qty + Category
-        
-        # First, check if line starts with item number (1, 1a, 2, 3, etc.)
+        # Equipment line pattern: starts with item number (1, 1a, 2, 3, 9a, etc.)
         item_match = re.match(r'^(\d+[a-z]?)\s+(.+)$', line, re.IGNORECASE)
         if not item_match:
             continue
@@ -158,64 +150,59 @@ def parse_equipment_from_text(text, debug=False):
         item_no = item_match.group(1)
         rest = item_match.group(2).strip()
         
-        # Skip if this looks like a note reference (e.g., "1 IH SUPPLY / IH INSTALL")
+        # Skip supplier code definitions (e.g., "1 IH SUPPLY / IH INSTALL")
         if re.match(r'^IH SUPPLY|^CONTRACTOR|^EXISTING', rest, re.IGNORECASE):
             continue
         
-        # Try to extract: [EquipNum] Description Qty Category [electrical specs...]
-        # The category (1-8) and qty appear before electrical specs
-        
-        # Look for the pattern where we have numbers at the end representing Qty and Category
-        # Electrical specs usually start with something like "12A", "120V", "JUNCTION", etc.
-        
-        # Strategy: Find category (1-8) which appears after qty
-        # Pattern: ... Qty Category [ElecSpecs]
-        # Qty is usually 1-9, Category is 1-8
-        
-        # Try matching with equipment number (like 9038, 1195.12, 1302.15)
+        # Check for NEW EQUIPMENT NUMBER at start (e.g., 9038, 1195.12, 1302.15)
+        equip_num = None
         equip_match = re.match(r'^(\d+\.?\d*)\s+(.+)$', rest)
-        
         if equip_match:
-            equip_num = equip_match.group(1)
-            remainder = equip_match.group(2)
-        else:
-            equip_num = None
-            remainder = rest
+            potential_equip = equip_match.group(1)
+            # Equipment numbers are typically 4+ digits or have decimal (like 1195.12)
+            if len(potential_equip) >= 4 or '.' in potential_equip:
+                equip_num = potential_equip
+                rest = equip_match.group(2).strip()
         
-        # Now extract description, qty, category from remainder
-        # Look for pattern: DESCRIPTION QTY CATEGORY [ELECTRICAL...]
-        # Category is 1-8, appears right after qty
-        # Electrical starts with patterns like: \dA, \dV, JUNCTION, RECEPTACLE, etc.
+        # Also check for "-" as equipment number (meaning none)
+        if rest.startswith('- '):
+            equip_num = '-'
+            rest = rest[2:].strip()
         
-        # Find where electrical specs might start
+        # Now parse: DESCRIPTION QTY CATEGORY [ELECTRICAL_SPECS...]
+        # Electrical specs start with patterns like: 12A, 0.3KW, JUNCTION, RECEPTACLE, etc.
+        
+        # Find where electrical specs begin
         elec_patterns = [
-            r'\d+A\s+\d+V',  # e.g., "12A 120V"
-            r'\d+\.?\d*KW',  # e.g., "0.3KW"
-            r'JUNCTION',
-            r'RECEPTACLE',
-            r'SEE NOTE',
-            r'TWO SERVICES',
-            r'SERVICES REQ',
-            r'LIGHTS',
-            r'\d+\s+FFD',  # Drain specs
-            r'STUB-UP',
-            r'WASTE TO',
+            r'\d+\.?\d*A\s+\d+V',      # e.g., "12A 120V", "14A 208V"
+            r'\d+\.?\d*KW\s+\d+V',     # e.g., "0.3KW 120V"
+            r'\d+\.?\d*A\s+\d+\.?\d*KW', # variations
+            r'\bJUNCTION\b',
+            r'\bRECEPTACLE\b',
+            r'\bSEE NOTE\b',
+            r'\bTWO SERVICES\b',
+            r'\bSERVICES REQ',
+            r'\bLIGHTS[;,]',
+            r'\d+\s+FFD\b',             # Drain specs
+            r'\bSTUB-UP\b',
+            r'\bWASTE TO\b',
+            r'\bX\s+X\s+X',             # placeholder specs
         ]
         
-        elec_start = len(remainder)
+        elec_start = len(rest)
         for pattern in elec_patterns:
-            m = re.search(pattern, remainder, re.IGNORECASE)
+            m = re.search(pattern, rest, re.IGNORECASE)
             if m and m.start() < elec_start:
                 elec_start = m.start()
         
-        # Get the part before electrical specs
-        before_elec = remainder[:elec_start].strip()
+        before_elec = rest[:elec_start].strip()
         
-        # Now parse: DESCRIPTION QTY CATEGORY
-        # Category is single digit 1-8, Qty is typically 1-9 (or more)
-        # They appear at the end
+        # Parse: DESCRIPTION QTY CATEGORY from before_elec
+        # Category is 1-8 or "-", Qty is typically 1-9 (could be larger)
+        # Pattern: "DESCRIPTION QTY CATEGORY" where both are at the end
         
-        # Try to find qty and category at the end
+        # Try to match qty and category at the end
+        # Format: "... DESCRIPTION X Y" where X=qty (1-99), Y=category (1-8 or -)
         qty_cat_match = re.search(r'\s+(\d+)\s+([1-8]|-)\s*$', before_elec)
         
         if qty_cat_match:
@@ -224,45 +211,46 @@ def parse_equipment_from_text(text, debug=False):
             cat_str = qty_cat_match.group(2)
             category = int(cat_str) if cat_str != '-' else None
         else:
-            # Try without category (some items marked as SPARE have "-" for category)
+            # Try with just qty (category might be missing or "-")
             qty_match = re.search(r'\s+(\d+)\s*$', before_elec)
             if qty_match:
                 description = before_elec[:qty_match.start()].strip()
                 qty = int(qty_match.group(1))
                 category = None
             else:
-                # Can't parse qty, skip
                 if debug:
-                    st.write(f"Could not parse: {line[:80]}...")
+                    st.write(f"⚠️ Could not parse qty/cat: {line[:80]}...")
                 continue
         
         # Clean up description
         description = re.sub(r'\s+', ' ', description).strip()
         
-        # Skip if description is too short or looks invalid
-        if len(description) < 3:
+        # Skip invalid entries
+        if len(description) < 2:
             continue
-        if description.upper() in ['NIC', 'N/A', '-', 'SPARE']:
-            # Still add SPARE items but mark them
-            pass
+        
+        # Handle SPARE items
+        if description.upper() == 'SPARE' or description == '-':
+            description = 'SPARE'
         
         equipment_list.append({
             'No': item_no,
+            'Equip_Num': equip_num if equip_num else '-',
             'Description': description,
             'Qty': qty,
             'Category': category
         })
         
-        if debug and len(equipment_list) <= 5:
-            st.write(f"Parsed: No={item_no}, Desc={description[:40]}..., Qty={qty}, Cat={category}")
+        if debug and len(equipment_list) <= 10:
+            st.write(f"✅ No={item_no}, Equip={equip_num}, Desc={description[:35]}..., Qty={qty}, Cat={category}")
     
     if debug:
-        st.write(f"**Total equipment items extracted from text:** {len(equipment_list)}")
+        st.write(f"**Total equipment items extracted:** {len(equipment_list)}")
     
     return equipment_list
 
 def extract_equipment_from_dataframe(df, debug=False):
-    """Extract equipment items from a dataframe with flexible column detection"""
+    """Extract equipment items from a dataframe"""
     equipment_list = []
     original_cols = df.columns.tolist()
     df = df.dropna(how='all').reset_index(drop=True)
@@ -273,15 +261,11 @@ def extract_equipment_from_dataframe(df, debug=False):
         st.write("**Normalized columns:**", df.columns.tolist())
     
     col_map = {
-        'no': ['no', 'no.', 'item', 'item #', 'item no', 'item no.', 'number', '#', 
-               'eq no', 'eq no.', 'equipment no', 'equipment no.', 'equip no', 
-               'equip no.', 'id', 'ref', 'ref.', 'reference', 'tag', 'tag no', 'tag no.'],
-        'description': ['description', 'desc', 'equipment', 'name', 'item description', 
-                       'equipment description', 'equip desc', 'equipment name', 
-                       'item name', 'remarks', 'details'],
-        'qty': ['qty', 'quantity', 'count', 'qnty', 'qty.', 'amount', 'units', 'ea'],
-        'category': ['category', 'cat', 'supplier code', 'code', 'supplier', 'type', 
-                    'supply', 'source', 'cat.', 'supplier cat']
+        'no': ['no', 'no.', 'item', 'item #', 'item no', 'item no.', 'number', '#'],
+        'equip_num': ['new equipment number', 'equipment number', 'equip num', 'equip no', 'equip no.', 'equipment no', 'equipment no.'],
+        'description': ['description', 'desc', 'equipment', 'name', 'item description'],
+        'qty': ['qty', 'qty.', 'quantity', 'count'],
+        'category': ['category', 'cat', 'supplier code', 'code', 'supplier']
     }
     
     found = {}
@@ -291,8 +275,6 @@ def extract_equipment_from_dataframe(df, debug=False):
             if col_clean in opts:
                 found[key] = col
                 break
-    
-    for key, opts in col_map.items():
         if key not in found:
             for col in df.columns:
                 col_clean = col.lower().strip()
@@ -303,24 +285,21 @@ def extract_equipment_from_dataframe(df, debug=False):
     if debug:
         st.write("**Found column mapping:**", found)
     
+    # Fallback for no/description if not found
     if 'no' not in found or 'description' not in found:
-        if len(df.columns) >= 2:
-            first_col = df.columns[0]
-            second_col = df.columns[1]
-            sample_vals = df[first_col].dropna().head(10).astype(str).tolist()
-            looks_like_numbers = any(
-                re.match(r'^\d+[a-zA-Z]?$', str(v).strip()) 
-                for v in sample_vals if str(v).strip()
-            )
-            if looks_like_numbers:
+        if len(df.columns) >= 3:
+            sample = df[df.columns[0]].dropna().head(10).astype(str).tolist()
+            if any(re.match(r'^\d+[a-zA-Z]?$', str(v).strip()) for v in sample if str(v).strip()):
                 if 'no' not in found:
-                    found['no'] = first_col
+                    found['no'] = df.columns[0]
+                if 'equip_num' not in found:
+                    found['equip_num'] = df.columns[1]
                 if 'description' not in found:
-                    found['description'] = second_col
+                    found['description'] = df.columns[2]
     
     if 'no' not in found or 'description' not in found:
         if debug:
-            st.error(f"Missing required columns. Found mapping: {found}")
+            st.error(f"Missing required columns. Found: {found}")
         return None
     
     for idx, row in df.iterrows():
@@ -328,19 +307,22 @@ def extract_equipment_from_dataframe(df, debug=False):
             no = str(row.get(found.get('no', ''), '')).strip()
             desc = str(row.get(found.get('description', ''), '')).strip()
             
-            if not no or no.lower() in ['nan', '', 'none', 'no', 'no.', 'item', 'item no', 'item no.']:
+            if not no or no.lower() in ['nan', '', 'none', 'no', 'no.', 'item']:
                 continue
-            if not desc or desc.lower() in ['nan', '', 'none', 'description', 'desc']:
+            if not desc or desc.lower() in ['nan', '', 'none', 'description']:
                 continue
-            if no.lower() == found.get('no', '').lower():
-                continue
+            
+            equip_num = '-'
+            if 'equip_num' in found:
+                en = str(row.get(found['equip_num'], '')).strip()
+                equip_num = en if en and en.lower() not in ['nan', '', 'none'] else '-'
             
             qty = 1
             if 'qty' in found:
                 try:
                     qval = str(row.get(found['qty'], 1)).replace(',', '').strip()
                     qval = re.sub(r'[^\d.]', '', qval)
-                    qty = int(float(qval)) if qval and qval.lower() not in ['nan', ''] else 1
+                    qty = int(float(qval)) if qval else 1
                 except:
                     pass
             
@@ -353,7 +335,13 @@ def extract_equipment_from_dataframe(df, debug=False):
                 except:
                     pass
             
-            equipment_list.append({'No': no, 'Description': desc, 'Qty': qty, 'Category': cat})
+            equipment_list.append({
+                'No': no, 
+                'Equip_Num': equip_num,
+                'Description': desc, 
+                'Qty': qty, 
+                'Category': cat
+            })
         except Exception as e:
             if debug:
                 st.write(f"Row {idx} error: {e}")
@@ -368,8 +356,8 @@ def process_drawing_file(parsed_data, debug=False):
     """Process drawing file and extract equipment list"""
     equipment_list = []
     
-    # For PDFs, try text parsing first (works better for complex tables)
     if parsed_data['type'] == 'pdf':
+        # Try text parsing first for PDFs
         if parsed_data.get('text'):
             if debug:
                 st.write("**Attempting text-based extraction...**")
@@ -379,7 +367,7 @@ def process_drawing_file(parsed_data, debug=False):
                 if debug:
                     st.success(f"Text extraction found {len(text_equip)} items")
         
-        # If text parsing didn't work well, try table extraction
+        # If text parsing got few results, try table extraction
         if len(equipment_list) < 5 and parsed_data.get('tables'):
             if debug:
                 st.write(f"**Trying table extraction ({len(parsed_data['tables'])} tables)...**")
@@ -399,9 +387,6 @@ def process_drawing_file(parsed_data, debug=False):
             ext = extract_equipment_from_dataframe(df, debug=debug)
             if ext:
                 equipment_list.extend(ext)
-    
-    if debug and not equipment_list:
-        st.warning("No equipment extracted from any source")
     
     # Remove duplicates
     seen = set()
@@ -547,11 +532,13 @@ def process_quote_file(parsed_data):
     return unique
 
 def match_quote_to_schedule(item, quotes):
+    """Match quote to schedule item by No"""
     no = str(item['No']).strip().lower()
     for q in quotes:
         qi = str(q.get('Item', '')).strip().lower()
         if no == qi:
             return q
+    # Try numeric match (ignore letter suffix)
     try:
         no_int = int(re.sub(r'[a-zA-Z]', '', no))
         for q in quotes:
@@ -566,15 +553,18 @@ def match_quote_to_schedule(item, quotes):
     return None
 
 def analyze_schedule_vs_quotes(schedule, quotes):
+    """Analyze equipment schedule against quotes"""
     analysis = []
     for item in schedule:
         match = match_quote_to_schedule(item, quotes)
         cat = item.get('Category')
+        
+        # Determine status based on category and quote match
         if cat in [1, 2, 3]:
             status, issue = "IH Supply", "IH handles supply & install"
         elif cat == 8:
             status, issue = "Existing", "Existing/relocated"
-        elif cat is None:
+        elif cat is None or item.get('Description', '').upper() == 'SPARE':
             status, issue = "N/A", "Spare or placeholder"
         elif match:
             if match['Qty'] == item['Qty']:
@@ -590,14 +580,16 @@ def analyze_schedule_vs_quotes(schedule, quotes):
                 status, issue = "❌ MISSING", "Critical - requires quote"
             else:
                 status, issue = "❌ MISSING", "Not found"
+        
         analysis.append({
             'No': item['No'],
+            'Equip_Num': item.get('Equip_Num', '-'),
             'Quote_Item': match['Item'] if match else '-',
             'Description': item['Description'],
             'Schedule_Qty': item['Qty'],
             'Quote_Qty': match['Qty'] if match else 0,
             'Supplier_Code': cat,
-            'Supplier_Desc': SUPPLIER_CODES.get(cat, 'Unknown'),
+            'Supplier_Desc': SUPPLIER_CODES.get(cat, 'Unknown') if cat else 'N/A',
             'Unit_Price': match['Unit_Price'] if match else 0,
             'Total_Price': match['Total_Price'] if match else 0,
             'Source_File': match['Source_File'] if match else '-',
@@ -624,7 +616,8 @@ with tabs[0]:
         if st.session_state.equipment_schedule and len(st.session_state.equipment_schedule) > 0:
             st.success(f"✅ Loaded: {st.session_state.drawing_filename} ({len(st.session_state.equipment_schedule)} items)")
             with st.expander("View Equipment Schedule"):
-                st.dataframe(pd.DataFrame(st.session_state.equipment_schedule), height=300)
+                df_preview = pd.DataFrame(st.session_state.equipment_schedule)
+                st.dataframe(df_preview, height=300)
         
         df_file = st.file_uploader("Select Drawing File", type=['pdf', 'csv', 'xlsx', 'xls'], key="draw")
         if df_file:
@@ -646,11 +639,10 @@ with tabs[0]:
                     else:
                         st.error("❌ Could not extract equipment.")
                         st.info("""
-**Tips to fix this:**
-1. Enable **Debug Mode** above to see parsing details
-2. For PDFs: The equipment list should have item numbers (1, 2, 3...) with descriptions
-3. For Excel/CSV: Need columns like `No.` and `Description`
-4. Try exporting your schedule to Excel format
+**Tips:**
+1. Enable **Debug Mode** to see parsing details
+2. For PDFs: Equipment list should have format: No. | Equip# | Description | Qty | Category
+3. For Excel: Need columns like `No.`, `Description`, `Qty.`, `CATEGORY`
                         """)
                         if not debug_mode:
                             with st.expander("📋 Click to see file structure"):
@@ -695,19 +687,19 @@ with tabs[0]:
             st.session_state.drawing_filename = None
             st.rerun()
     with col2:
-        with st.expander("🔧 Debug Info"):
-            st.write(f"Equipment loaded: {st.session_state.equipment_schedule is not None and len(st.session_state.equipment_schedule) > 0 if st.session_state.equipment_schedule else False}")
+        with st.expander("🔧 Session Info"):
             st.write(f"Equipment count: {len(st.session_state.equipment_schedule) if st.session_state.equipment_schedule else 0}")
-            st.write(f"Quotes loaded: {len(st.session_state.quotes_data) if st.session_state.quotes_data else 0}")
+            st.write(f"Quote files: {len(st.session_state.quotes_data) if st.session_state.quotes_data else 0}")
 
 with tabs[1]:
-    if st.session_state.equipment_schedule is None or len(st.session_state.equipment_schedule) == 0:
+    if not st.session_state.equipment_schedule or len(st.session_state.equipment_schedule) == 0:
         st.warning("⚠️ Upload drawing first (go to Upload tab)")
-    elif st.session_state.quotes_data is None or len(st.session_state.quotes_data) == 0:
+    elif not st.session_state.quotes_data or len(st.session_state.quotes_data) == 0:
         st.warning("⚠️ Upload quotes first (go to Upload tab)")
     else:
         all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
         df = analyze_schedule_vs_quotes(st.session_state.equipment_schedule, all_q)
+        
         st.subheader("📊 Coverage Summary")
         act = df[~df['Status'].isin(['IH Supply', 'Existing', 'N/A'])]
         c1, c2, c3, c4 = st.columns(4)
@@ -715,61 +707,124 @@ with tabs[1]:
         c2.metric("❌ Missing", len(act[act['Status'] == '❌ MISSING']))
         c3.metric("⚠ Qty Mismatch", len(act[act['Status'] == '⚠ Qty Mismatch']))
         c4.metric("⚠ Needs Install", len(act[act['Status'] == '⚠ Needs Install']))
-        st.metric("💰 Total Quoted", f"${df['Total_Price'].sum():,.2f}")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("💰 Total Quoted Value", f"${df['Total_Price'].sum():,.2f}")
+        with col2:
+            total_items = len(df)
+            actionable = len(act)
+            st.metric("📦 Total Items", f"{total_items} ({actionable} actionable)")
+        
         ch1, ch2 = st.columns(2)
         with ch1:
             vc = df['Status'].value_counts().reset_index()
             vc.columns = ['Status', 'Count']
-            cm = {'✓ Quoted': '#28a745', '❌ MISSING': '#dc3545', '⚠ Qty Mismatch': '#ffc107', '⚠ Needs Install': '#fd7e14', 'IH Supply': '#6c757d', 'Existing': '#adb5bd', 'N/A': '#e9ecef'}
-            fig = px.pie(vc, values='Count', names='Status', color='Status', color_discrete_map=cm)
+            cm = {'✓ Quoted': '#28a745', '❌ MISSING': '#dc3545', '⚠ Qty Mismatch': '#ffc107', 
+                  '⚠ Needs Install': '#fd7e14', 'IH Supply': '#6c757d', 'Existing': '#adb5bd', 'N/A': '#e9ecef'}
+            fig = px.pie(vc, values='Count', names='Status', color='Status', color_discrete_map=cm, title="Status Distribution")
             st.plotly_chart(fig, use_container_width=True)
+        
+        with ch2:
+            # Category breakdown
+            cat_summary = df.groupby('Supplier_Code').agg({'No': 'count', 'Total_Price': 'sum'}).reset_index()
+            cat_summary.columns = ['Code', 'Items', 'Value']
+            cat_summary = cat_summary[cat_summary['Code'].notna()]
+            cat_summary['Code'] = cat_summary['Code'].astype(int)
+            cat_summary['Label'] = cat_summary['Code'].map(lambda x: f"Code {x}")
+            fig2 = px.bar(cat_summary, x='Label', y='Items', title="Items by Supplier Code", color='Value')
+            st.plotly_chart(fig2, use_container_width=True)
 
 with tabs[2]:
     if st.session_state.equipment_schedule and len(st.session_state.equipment_schedule) > 0 and st.session_state.quotes_data and len(st.session_state.quotes_data) > 0:
         all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
         df = analyze_schedule_vs_quotes(st.session_state.equipment_schedule, all_q)
-        st.subheader("📋 Full Report")
-        filt = st.multiselect("Filter Status", df['Status'].unique().tolist(), default=df['Status'].unique().tolist())
-        fdf = df[df['Status'].isin(filt)]
-        def hl(row):
-            cm = {'✓ Quoted': 'background-color:#d4edda', '❌ MISSING': 'background-color:#f8d7da', '⚠ Qty Mismatch': 'background-color:#fff3cd', '⚠ Needs Install': 'background-color:#ffe5d0'}
+        
+        st.subheader("📋 Full Analysis Report")
+        
+        # Filters
+        col1, col2 = st.columns(2)
+        with col1:
+            filt_status = st.multiselect("Filter by Status", df['Status'].unique().tolist(), default=df['Status'].unique().tolist())
+        with col2:
+            filt_cat = st.multiselect("Filter by Supplier Code", sorted([c for c in df['Supplier_Code'].unique() if c is not None]), 
+                                      default=sorted([c for c in df['Supplier_Code'].unique() if c is not None]))
+        
+        fdf = df[df['Status'].isin(filt_status)]
+        if filt_cat:
+            fdf = fdf[(fdf['Supplier_Code'].isin(filt_cat)) | (fdf['Supplier_Code'].isna())]
+        
+        def highlight_status(row):
+            cm = {'✓ Quoted': 'background-color:#d4edda', '❌ MISSING': 'background-color:#f8d7da', 
+                  '⚠ Qty Mismatch': 'background-color:#fff3cd', '⚠ Needs Install': 'background-color:#ffe5d0'}
             return [cm.get(row['Status'], '')] * len(row)
-        st.dataframe(fdf.style.apply(hl, axis=1), height=500)
-        st.subheader("🚨 Critical Missing (Codes 5 & 6)")
+        
+        st.dataframe(fdf.style.apply(highlight_status, axis=1), height=500, use_container_width=True)
+        
+        # Critical Missing section
+        st.subheader("🚨 Critical Missing (Supplier Codes 5 & 6)")
         crit = df[(df['Status'] == '❌ MISSING') & (df['Supplier_Code'].isin([5, 6]))]
         if not crit.empty:
-            st.dataframe(crit[['No', 'Description', 'Schedule_Qty', 'Supplier_Desc']])
+            st.error(f"Found {len(crit)} critical missing items that require contractor quotes!")
+            st.dataframe(crit[['No', 'Equip_Num', 'Description', 'Schedule_Qty', 'Supplier_Code', 'Supplier_Desc']], use_container_width=True)
         else:
-            st.success("✅ No critical missing!")
+            st.success("✅ No critical missing items!")
 
 with tabs[3]:
     if st.session_state.equipment_schedule and len(st.session_state.equipment_schedule) > 0 and st.session_state.quotes_data and len(st.session_state.quotes_data) > 0:
         all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
         df = analyze_schedule_vs_quotes(st.session_state.equipment_schedule, all_q)
-        st.subheader("🔢 By Supplier Code")
+        
+        st.subheader("🔢 Summary by Supplier Code")
         summary = []
         for code, desc in SUPPLIER_CODES.items():
             ci = df[df['Supplier_Code'] == code]
             if len(ci) > 0:
-                summary.append({'Code': code, 'Description': desc, 'Items': len(ci), 
-                               'Quoted': len(ci[ci['Status'].isin(['✓ Quoted'])]),
-                               'Missing': len(ci[ci['Status'] == '❌ MISSING']),
-                               'Value': ci['Total_Price'].sum()})
-        st.dataframe(pd.DataFrame(summary))
+                summary.append({
+                    'Code': code, 
+                    'Description': desc, 
+                    'Total Items': len(ci),
+                    'Quoted': len(ci[ci['Status'] == '✓ Quoted']),
+                    'Missing': len(ci[ci['Status'] == '❌ MISSING']),
+                    'Needs Install': len(ci[ci['Status'] == '⚠ Needs Install']),
+                    'Total Value': f"${ci['Total_Price'].sum():,.2f}"
+                })
+        
+        st.dataframe(pd.DataFrame(summary), use_container_width=True)
+        
+        # Items with no category
+        no_cat = df[df['Supplier_Code'].isna()]
+        if len(no_cat) > 0:
+            st.subheader("📋 Items with No Category (SPARE/Placeholder)")
+            st.dataframe(no_cat[['No', 'Equip_Num', 'Description', 'Schedule_Qty']], use_container_width=True)
 
 with tabs[4]:
+    st.subheader("📥 Export Data")
+    
+    if st.session_state.equipment_schedule and len(st.session_state.equipment_schedule) > 0:
+        # Export equipment schedule only
+        st.write("**Equipment Schedule:**")
+        eq_df = pd.DataFrame(st.session_state.equipment_schedule)
+        out_eq = io.BytesIO()
+        eq_df.to_excel(out_eq, index=False)
+        out_eq.seek(0)
+        st.download_button("📥 Equipment Schedule (Excel)", out_eq, f"Equipment_{datetime.now().strftime('%Y%m%d')}.xlsx")
+    
     if st.session_state.equipment_schedule and len(st.session_state.equipment_schedule) > 0 and st.session_state.quotes_data and len(st.session_state.quotes_data) > 0:
         all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
         df = analyze_schedule_vs_quotes(st.session_state.equipment_schedule, all_q)
-        st.subheader("📥 Export")
+        
+        st.write("**Full Analysis Report:**")
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine='openpyxl') as w:
-            df.to_excel(w, sheet_name='Analysis', index=False)
-            df[df['Status'] == '❌ MISSING'].to_excel(w, sheet_name='Missing', index=False)
+            df.to_excel(w, sheet_name='Full Analysis', index=False)
+            df[df['Status'] == '❌ MISSING'].to_excel(w, sheet_name='Missing Items', index=False)
+            df[(df['Status'] == '❌ MISSING') & (df['Supplier_Code'].isin([5, 6]))].to_excel(w, sheet_name='Critical Missing', index=False)
             pd.DataFrame(all_q).to_excel(w, sheet_name='All Quotes', index=False)
         out.seek(0)
-        st.download_button("📥 Excel Report", out, f"Analysis_{datetime.now().strftime('%Y%m%d')}.xlsx")
+        st.download_button("📥 Full Analysis Report (Excel)", out, f"Analysis_{datetime.now().strftime('%Y%m%d')}.xlsx")
     
+    # Debug section
     if st.session_state.quotes_data and len(st.session_state.quotes_data) > 0:
         st.subheader("📄 Extracted Quotes (Debug)")
         for fn, qs in st.session_state.quotes_data.items():
@@ -777,7 +832,7 @@ with tabs[4]:
                 st.dataframe(pd.DataFrame(qs))
     
     st.subheader("🔧 PDF Text Debug")
-    dbg = st.file_uploader("Upload PDF", type=['pdf'], key="dbg")
+    dbg = st.file_uploader("Upload PDF to view raw text", type=['pdf'], key="dbg")
     if dbg and PDF_SUPPORT:
         dbg.seek(0)
         with pdfplumber.open(dbg) as pdf:
@@ -786,4 +841,4 @@ with tabs[4]:
                     st.text(p.extract_text())
 
 st.markdown("---")
-st.markdown("<center>Equipment Quote Analyzer v6.0 | PDF Text Parsing for Zeidler Drawings</center>", unsafe_allow_html=True)
+st.markdown("<center>Equipment Quote Analyzer v6.1 | Zeidler/FWG Format Support</center>", unsafe_allow_html=True)
