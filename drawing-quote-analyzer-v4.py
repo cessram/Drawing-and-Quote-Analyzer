@@ -139,7 +139,7 @@ def extract_equipment_from_pdf_text(text):
             if match:
                 groups = match.groups()
                 item = {
-                    'Item': groups[0],
+                    'No': groups[0],
                     'Description': groups[1].strip(),
                     'Qty': int(groups[2]) if len(groups) > 2 else 1,
                     'Category': int(groups[3]) if len(groups) > 3 else None
@@ -156,8 +156,9 @@ def extract_equipment_from_dataframe(df):
     
     df.columns = df.columns.astype(str).str.strip().str.lower()
     
+    # Updated column mapping - prioritize "no" and "no." for drawing files
     col_mapping = {
-        'item': ['item', 'item #', 'item#', 'no', 'no.', 'number', '#'],
+        'no': ['no', 'no.', 'item', 'item #', 'item#', 'item no', 'item no.', 'number', '#'],
         'description': ['description', 'desc', 'equipment', 'name', 'item description'],
         'qty': ['qty', 'quantity', 'qnty', 'count', 'units'],
         'category': ['category', 'cat', 'supplier code', 'code', 'supplier', 'type']
@@ -166,19 +167,26 @@ def extract_equipment_from_dataframe(df):
     found_cols = {}
     for key, possibilities in col_mapping.items():
         for col in df.columns:
-            if any(p in col.lower() for p in possibilities):
+            col_clean = col.lower().strip()
+            if any(p == col_clean for p in possibilities):
                 found_cols[key] = col
                 break
+        # If exact match not found, try partial match
+        if key not in found_cols:
+            for col in df.columns:
+                if any(p in col.lower() for p in possibilities):
+                    found_cols[key] = col
+                    break
     
-    if 'item' not in found_cols or 'description' not in found_cols:
+    if 'no' not in found_cols or 'description' not in found_cols:
         return None
     
     for _, row in df.iterrows():
         try:
-            item_val = str(row.get(found_cols.get('item', ''), '')).strip()
+            no_val = str(row.get(found_cols.get('no', ''), '')).strip()
             desc_val = str(row.get(found_cols.get('description', ''), '')).strip()
             
-            if not item_val or not desc_val or item_val.lower() in ['nan', '', 'none']:
+            if not no_val or not desc_val or no_val.lower() in ['nan', '', 'none']:
                 continue
             if desc_val.lower() in ['nan', '', 'none', 'description']:
                 continue
@@ -196,7 +204,7 @@ def extract_equipment_from_dataframe(df):
                 cat_val = None
             
             equipment_list.append({
-                'Item': item_val,
+                'No': no_val,
                 'Description': desc_val,
                 'Qty': qty_val,
                 'Category': cat_val
@@ -229,7 +237,7 @@ def process_drawing_file(parsed_data):
     seen = set()
     unique_list = []
     for item in equipment_list:
-        key = (item['Item'], item['Description'])
+        key = (item['No'], item['Description'])
         if key not in seen:
             seen.add(key)
             unique_list.append(item)
@@ -243,22 +251,19 @@ def parse_crs_quote_from_text(text, filename):
     quotes = []
     lines = text.split('\n')
     
-    current_item = None
+    current_item_no = None
     current_qty = 0
     current_desc = ""
     current_unit_price = 0
     current_total_price = 0
     
-    # Pattern for main item line: Item# Qty ea DESCRIPTION $Price $Total
-    # Examples: "2 1 ea WALK IN $97,980.27 $97,980.27"
-    #           "24 1 ea INGREDIENT BIN $386.48 $386.48"
-    #           "47 2 ea COMBI OVEN, ELECTRIC $41,165.40"
+    # Pattern for main item line: ItemNo Qty ea DESCRIPTION $Price $Total
     main_pattern = re.compile(
         r'^(\d+[a-z]?)\s+(\d+)\s*ea\s+([A-Z][A-Z\s,\./&\-\(\)\']+?)\s+\$?([\d,]+\.?\d*)\s*(?:\$?([\d,]+\.?\d*))?',
         re.IGNORECASE
     )
     
-    # Alternative pattern: Item# Qty ea DESCRIPTION (price on next line or no price shown)
+    # Alternative pattern: ItemNo Qty ea DESCRIPTION (price on next line or no price shown)
     alt_pattern = re.compile(
         r'^(\d+[a-z]?)\s+(\d+)\s*ea\s+([A-Z][A-Z\s,\./&\-\(\)\']+)',
         re.IGNORECASE
@@ -290,9 +295,9 @@ def parse_crs_quote_from_text(text, filename):
         match = main_pattern.match(line)
         if match:
             # Save previous item if exists
-            if current_item and current_desc:
+            if current_item_no and current_desc:
                 quotes.append({
-                    'Item': current_item,
+                    'Item_No': current_item_no,
                     'Description': current_desc.strip(),
                     'Qty': current_qty,
                     'Unit_Price': current_unit_price,
@@ -300,7 +305,7 @@ def parse_crs_quote_from_text(text, filename):
                     'Source_File': filename
                 })
             
-            current_item = match.group(1)
+            current_item_no = match.group(1)
             current_qty = int(match.group(2))
             current_desc = match.group(3).strip()
             
@@ -320,9 +325,9 @@ def parse_crs_quote_from_text(text, filename):
         alt_match = alt_pattern.match(line)
         if alt_match:
             # Save previous item if exists
-            if current_item and current_desc:
+            if current_item_no and current_desc:
                 quotes.append({
-                    'Item': current_item,
+                    'Item_No': current_item_no,
                     'Description': current_desc.strip(),
                     'Qty': current_qty,
                     'Unit_Price': current_unit_price,
@@ -330,7 +335,7 @@ def parse_crs_quote_from_text(text, filename):
                     'Source_File': filename
                 })
             
-            current_item = alt_match.group(1)
+            current_item_no = alt_match.group(1)
             current_qty = int(alt_match.group(2))
             current_desc = alt_match.group(3).strip()
             current_unit_price = 0
@@ -346,12 +351,12 @@ def parse_crs_quote_from_text(text, filename):
         
         # Check for ITEM TOTAL line
         total_match = total_pattern.search(line)
-        if total_match and current_item:
+        if total_match and current_item_no:
             current_total_price = float(total_match.group(1).replace(',', ''))
             continue
         
         # Check for standalone price line
-        if current_item and not current_total_price:
+        if current_item_no and not current_total_price:
             price_match = price_pattern.search(line)
             if price_match and not any(c.isalpha() for c in line.replace('ITEM TOTAL:', '')):
                 price_val = float(price_match.group(1).replace(',', ''))
@@ -360,9 +365,9 @@ def parse_crs_quote_from_text(text, filename):
                 current_total_price = price_val
     
     # Don't forget the last item
-    if current_item and current_desc:
+    if current_item_no and current_desc:
         quotes.append({
-            'Item': current_item,
+            'Item_No': current_item_no,
             'Description': current_desc.strip(),
             'Qty': current_qty,
             'Unit_Price': current_unit_price,
@@ -378,8 +383,9 @@ def extract_quotes_from_dataframe(df, filename):
     
     df.columns = df.columns.astype(str).str.strip().str.lower()
     
+    # Updated column mapping - prioritize "item no" and "item no." for quote files
     col_mapping = {
-        'item': ['item', 'item #', 'item#', 'no', 'no.', 'line', 'ref'],
+        'item_no': ['item no', 'item no.', 'item #', 'item#', 'item', 'no', 'no.', 'line', 'ref', 'number'],
         'description': ['description', 'desc', 'equipment', 'name', 'product'],
         'qty': ['qty', 'quantity', 'qnty', 'count', 'units'],
         'unit_price': ['unit price', 'unit', 'price', 'unit cost', 'each', 'sell'],
@@ -390,9 +396,16 @@ def extract_quotes_from_dataframe(df, filename):
     for key, possibilities in col_mapping.items():
         for col in df.columns:
             col_clean = col.lower().strip()
-            if any(p == col_clean or p in col_clean for p in possibilities):
+            if any(p == col_clean for p in possibilities):
                 found_cols[key] = col
                 break
+        # If exact match not found, try partial match
+        if key not in found_cols:
+            for col in df.columns:
+                col_clean = col.lower().strip()
+                if any(p in col_clean for p in possibilities):
+                    found_cols[key] = col
+                    break
     
     for _, row in df.iterrows():
         try:
@@ -400,7 +413,7 @@ def extract_quotes_from_dataframe(df, filename):
             if not desc_val or desc_val.lower() in ['nan', '', 'none', 'description', 'nic']:
                 continue
             
-            item_val = str(row.get(found_cols.get('item', ''), '')).strip()
+            item_no_val = str(row.get(found_cols.get('item_no', ''), '')).strip()
             
             qty_val = row.get(found_cols.get('qty', ''), 1)
             # Handle "X ea" format
@@ -425,7 +438,7 @@ def extract_quotes_from_dataframe(df, filename):
                 total_price = unit_price * qty_val if unit_price else 0
             
             quotes.append({
-                'Item': item_val,
+                'Item_No': item_no_val,
                 'Description': desc_val,
                 'Qty': qty_val,
                 'Unit_Price': unit_price,
@@ -459,12 +472,12 @@ def process_quote_file(parsed_data):
             if extracted:
                 quotes.extend(extracted)
     
-    # Remove duplicates based on Item number
+    # Remove duplicates based on Item_No
     seen_items = set()
     unique_quotes = []
     for q in quotes:
-        if q['Item'] not in seen_items:
-            seen_items.add(q['Item'])
+        if q['Item_No'] not in seen_items:
+            seen_items.add(q['Item_No'])
             unique_quotes.append(q)
     
     return unique_quotes
@@ -472,17 +485,17 @@ def process_quote_file(parsed_data):
 # ==================== ANALYSIS FUNCTIONS ====================
 
 def match_quote_to_schedule(schedule_item, all_quotes):
-    """Find matching quote for a schedule item using fuzzy matching"""
-    item_num = str(schedule_item['Item']).strip().lower()
+    """Find matching quote for a schedule item - PRIMARY match on No./Item_No"""
+    item_no = str(schedule_item['No']).strip().lower()
     desc = schedule_item['Description'].upper()
     
-    # First try exact item number match
+    # PRIMARY: Exact match on No. (drawing) vs Item_No (quote)
     for quote in all_quotes:
-        quote_item = str(quote.get('Item', '')).strip().lower()
-        if item_num and quote_item and item_num == quote_item:
+        quote_item_no = str(quote.get('Item_No', '')).strip().lower()
+        if item_no and quote_item_no and item_no == quote_item_no:
             return quote
     
-    # Then try description matching
+    # SECONDARY: Try description matching only if no item number match
     for quote in all_quotes:
         quote_desc = quote['Description'].upper()
         
@@ -541,7 +554,7 @@ def analyze_schedule_vs_quotes(equipment_schedule, all_quotes):
                 issue = "Not found in any quote"
         
         analysis.append({
-            'Item': item['Item'],
+            'No': item['No'],
             'Description': item['Description'],
             'Schedule_Qty': item['Qty'],
             'Quote_Qty': matched_quote['Qty'] if matched_quote else 0,
@@ -558,7 +571,7 @@ def analyze_schedule_vs_quotes(equipment_schedule, all_quotes):
 
 # ==================== MAIN UI ====================
 
-st.markdown('<p class="main-header"> 🔍 Equipment Quote Analyzer</p>', unsafe_allow_html=True)
+st.markdown('<p class="main-header">🔍 Equipment Quote Analyzer</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-header">Upload drawings and quotations (PDF, CSV, XLSX) for analysis</p>', unsafe_allow_html=True)
 
 if not PDF_SUPPORT:
@@ -581,7 +594,7 @@ with tabs[0]:
     
     with col1:
         st.subheader("📐 Upload Drawing / Equipment Schedule")
-        st.info("Upload the kitchen drawings or equipment schedule file. Supported formats: PDF, CSV, XLSX")
+        st.info("Upload the equipment schedule drawing file. Supported formats: PDF, CSV, XLSX. Must have 'No.' column.")
         
         drawing_file = st.file_uploader(
             "Select Drawing File",
@@ -603,14 +616,14 @@ with tabs[0]:
                             preview_df = pd.DataFrame(equipment)
                             st.dataframe(preview_df, use_container_width=True, height=300)
                     else:
-                        st.error("Could not extract equipment schedule. Please ensure the file has Item, Description, Qty columns.")
+                        st.error("Could not extract equipment schedule. Ensure file has No., Description, Qty columns.")
         
         if st.session_state.equipment_schedule:
             st.markdown(f"**Current Schedule:** {st.session_state.drawing_filename} ({len(st.session_state.equipment_schedule)} items)")
     
     with col2:
         st.subheader("📝 Upload Quotations")
-        st.info("Upload one or more quotation files (CRS format supported). Supported formats: PDF, CSV, XLSX")
+        st.info("Upload one or more quotation files. Must have 'Item No.' column. Supported formats: PDF, CSV, XLSX")
         
         quote_files = st.file_uploader(
             "Select Quote Files",
@@ -630,7 +643,6 @@ with tabs[0]:
                                 st.session_state.quotes_data[quote_file.name] = quotes
                                 st.success(f"✅ Extracted {len(quotes)} items from {quote_file.name}")
                                 
-                                # Show preview of extracted quotes
                                 with st.expander(f"Preview: {quote_file.name}", expanded=False):
                                     preview_df = pd.DataFrame(quotes)
                                     st.dataframe(preview_df, use_container_width=True, height=200)
@@ -745,7 +757,7 @@ with tabs[2]:
             }
             return [color_map.get(row['Status'], '')] * len(row)
         
-        display_df = filtered_df[['Item', 'Description', 'Schedule_Qty', 'Quote_Qty', 
+        display_df = filtered_df[['No', 'Description', 'Schedule_Qty', 'Quote_Qty', 
                                   'Supplier_Code', 'Unit_Price', 'Total_Price', 'Source_File', 'Status', 'Issue']]
         
         st.dataframe(
@@ -758,7 +770,7 @@ with tabs[2]:
         critical = analysis_df[(analysis_df['Status'] == '❌ MISSING') & 
                                (analysis_df['Supplier_Code'].isin([5, 6]))]
         if not critical.empty:
-            st.dataframe(critical[['Item', 'Description', 'Schedule_Qty', 'Supplier_Desc', 'Issue']], 
+            st.dataframe(critical[['No', 'Description', 'Schedule_Qty', 'Supplier_Desc', 'Issue']], 
                         use_container_width=True)
         else:
             st.success("✅ No critical missing items!")
@@ -832,7 +844,7 @@ with tabs[4]:
         st.download_button(
             label="📥 Download Full Excel Report",
             data=output,
-            file_name=f"Kitchen_Quote_Analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            file_name=f"Equipment_Quote_Analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
         
@@ -857,7 +869,8 @@ with tabs[4]:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666; padding: 20px;'>
-    <p>Kitchen Equipment Quote Analyzer v5.1 | Built for Bird Construction</p>
+    <p>Equipment Quote Analyzer v5.2 | Built for Bird Construction</p>
     <p>Supported Formats: PDF (CRS format), CSV, XLSX</p>
+    <p>Matching: Drawing "No." column ↔ Quote "Item No." column</p>
 </div>
 """, unsafe_allow_html=True)
