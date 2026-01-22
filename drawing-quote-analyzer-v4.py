@@ -345,53 +345,79 @@ with tabs[0]:
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("📐 Drawing / Equipment Schedule")
-        df_file = st.file_uploader("Select Drawing", type=['pdf', 'csv', 'xlsx', 'xls'], key="draw")
+        
+        # Show current status
+        if st.session_state.equipment_schedule and len(st.session_state.equipment_schedule) > 0:
+            st.success(f"✅ Loaded: {st.session_state.drawing_filename} ({len(st.session_state.equipment_schedule)} items)")
+            with st.expander("View Equipment Schedule"):
+                st.dataframe(pd.DataFrame(st.session_state.equipment_schedule), height=300)
+        
+        df_file = st.file_uploader("Select Drawing File", type=['pdf', 'csv', 'xlsx', 'xls'], key="draw")
         if df_file:
-            parsed = parse_uploaded_file(df_file)
-            if parsed:
-                equip = process_drawing_file(parsed)
-                if equip:
-                    st.session_state.equipment_schedule = equip
-                    st.session_state.drawing_filename = df_file.name
-                    st.success(f"✅ {len(equip)} items from {df_file.name}")
-                    with st.expander("Preview", expanded=True):
-                        st.dataframe(pd.DataFrame(equip), height=300)
-        if st.session_state.equipment_schedule:
-            st.info(f"Loaded: {st.session_state.drawing_filename}")
+            with st.spinner("Processing drawing..."):
+                parsed = parse_uploaded_file(df_file)
+                if parsed:
+                    equip = process_drawing_file(parsed)
+                    if equip and len(equip) > 0:
+                        st.session_state.equipment_schedule = equip
+                        st.session_state.drawing_filename = df_file.name
+                        st.success(f"✅ Extracted {len(equip)} items from {df_file.name}")
+                        st.rerun()
+                    else:
+                        st.error("❌ Could not extract equipment. Check file has 'No.' and 'Description' columns.")
+                else:
+                    st.error("❌ Could not parse file.")
     
     with c2:
         st.subheader("📝 Quotations")
-        qf = st.file_uploader("Select Quotes", type=['pdf', 'csv', 'xlsx', 'xls'], key="quote", accept_multiple_files=True)
+        
+        # Show current status
+        if st.session_state.quotes_data and len(st.session_state.quotes_data) > 0:
+            st.success(f"✅ {len(st.session_state.quotes_data)} quote file(s) loaded")
+            for fn, qs in st.session_state.quotes_data.items():
+                st.markdown(f"- **{fn}**: {len(qs)} items (${sum(q['Total_Price'] for q in qs):,.2f})")
+        
+        qf = st.file_uploader("Select Quote Files", type=['pdf', 'csv', 'xlsx', 'xls'], key="quote", accept_multiple_files=True)
         if qf:
             for f in qf:
                 if f.name not in st.session_state.quotes_data:
-                    parsed = parse_uploaded_file(f)
-                    if parsed:
-                        q = process_quote_file(parsed)
-                        if q:
-                            st.session_state.quotes_data[f.name] = q
-                            st.success(f"✅ {len(q)} items from {f.name}")
-                            with st.expander(f"Preview: {f.name}"):
-                                st.dataframe(pd.DataFrame(q), height=200)
-        if st.session_state.quotes_data:
-            st.markdown("**Loaded:**")
-            for fn, qs in st.session_state.quotes_data.items():
-                st.markdown(f"- {fn}: {len(qs)} items (${sum(q['Total_Price'] for q in qs):,.2f})")
-            if st.button("Clear Quotes"):
+                    with st.spinner(f"Processing {f.name}..."):
+                        parsed = parse_uploaded_file(f)
+                        if parsed:
+                            q = process_quote_file(parsed)
+                            if q and len(q) > 0:
+                                st.session_state.quotes_data[f.name] = q
+                                st.success(f"✅ Extracted {len(q)} items from {f.name}")
+                                with st.expander(f"Preview: {f.name}"):
+                                    st.dataframe(pd.DataFrame(q), height=200)
+                            else:
+                                st.warning(f"⚠️ No items extracted from {f.name}")
+        
+        if st.session_state.quotes_data and len(st.session_state.quotes_data) > 0:
+            if st.button("🗑️ Clear All Quotes"):
                 st.session_state.quotes_data = {}
                 st.rerun()
     
-    if st.button("🔄 Reset All"):
-        st.session_state.equipment_schedule = None
-        st.session_state.quotes_data = {}
-        st.session_state.drawing_filename = None
-        st.rerun()
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🔄 Reset All Data"):
+            st.session_state.equipment_schedule = None
+            st.session_state.quotes_data = {}
+            st.session_state.drawing_filename = None
+            st.rerun()
+    with col2:
+        # Debug info
+        with st.expander("🔧 Debug Info"):
+            st.write(f"Equipment loaded: {st.session_state.equipment_schedule is not None and len(st.session_state.equipment_schedule) > 0 if st.session_state.equipment_schedule else False}")
+            st.write(f"Equipment count: {len(st.session_state.equipment_schedule) if st.session_state.equipment_schedule else 0}")
+            st.write(f"Quotes loaded: {len(st.session_state.quotes_data) if st.session_state.quotes_data else 0}")
 
 with tabs[1]:
-    if not st.session_state.equipment_schedule:
-        st.warning("Upload drawing first")
-    elif not st.session_state.quotes_data:
-        st.warning("Upload quotes first")
+    if st.session_state.equipment_schedule is None or len(st.session_state.equipment_schedule) == 0:
+        st.warning("⚠️ Upload drawing first (go to Upload tab)")
+    elif st.session_state.quotes_data is None or len(st.session_state.quotes_data) == 0:
+        st.warning("⚠️ Upload quotes first (go to Upload tab)")
     else:
         all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
         df = analyze_schedule_vs_quotes(st.session_state.equipment_schedule, all_q)
@@ -412,7 +438,7 @@ with tabs[1]:
             st.plotly_chart(fig, use_container_width=True)
 
 with tabs[2]:
-    if st.session_state.equipment_schedule and st.session_state.quotes_data:
+    if st.session_state.equipment_schedule and len(st.session_state.equipment_schedule) > 0 and st.session_state.quotes_data and len(st.session_state.quotes_data) > 0:
         all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
         df = analyze_schedule_vs_quotes(st.session_state.equipment_schedule, all_q)
         st.subheader("📋 Full Report")
@@ -430,7 +456,7 @@ with tabs[2]:
             st.success("✅ No critical missing!")
 
 with tabs[3]:
-    if st.session_state.equipment_schedule and st.session_state.quotes_data:
+    if st.session_state.equipment_schedule and len(st.session_state.equipment_schedule) > 0 and st.session_state.quotes_data and len(st.session_state.quotes_data) > 0:
         all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
         df = analyze_schedule_vs_quotes(st.session_state.equipment_schedule, all_q)
         st.subheader("🔢 By Supplier Code")
@@ -445,7 +471,7 @@ with tabs[3]:
         st.dataframe(pd.DataFrame(summary))
 
 with tabs[4]:
-    if st.session_state.equipment_schedule and st.session_state.quotes_data:
+    if st.session_state.equipment_schedule and len(st.session_state.equipment_schedule) > 0 and st.session_state.quotes_data and len(st.session_state.quotes_data) > 0:
         all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
         df = analyze_schedule_vs_quotes(st.session_state.equipment_schedule, all_q)
         st.subheader("📥 Export")
@@ -457,7 +483,7 @@ with tabs[4]:
         out.seek(0)
         st.download_button("📥 Excel Report", out, f"Analysis_{datetime.now().strftime('%Y%m%d')}.xlsx")
     
-    if st.session_state.quotes_data:
+    if st.session_state.quotes_data and len(st.session_state.quotes_data) > 0:
         st.subheader("📄 Extracted Quotes (Debug)")
         for fn, qs in st.session_state.quotes_data.items():
             with st.expander(f"{fn} - {len(qs)} items"):
@@ -473,4 +499,4 @@ with tabs[4]:
                     st.text(p.extract_text())
 
 st.markdown("---")
-st.markdown("<center>Equipment Quote Analyzer v5.6 | Drawing No. ↔ Quote Item</center>", unsafe_allow_html=True)
+st.markdown("<center>Equipment Quote Analyzer v5.7 | Drawing No. ↔ Quote Item</center>", unsafe_allow_html=True)
