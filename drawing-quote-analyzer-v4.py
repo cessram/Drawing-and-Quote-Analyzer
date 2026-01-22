@@ -39,7 +39,7 @@ def parse_pdf_file(uploaded_file):
     all_tables = []
     uploaded_file.seek(0)
     with pdfplumber.open(uploaded_file) as pdf:
-        for page_num, page in enumerate(pdf.pages):
+        for page in pdf.pages:
             text = page.extract_text()
             if text:
                 text_content.append(text)
@@ -84,8 +84,10 @@ def parse_uploaded_file(uploaded_file):
     return None
 
 def show_file_preview(parsed_data):
-    """Show a preview of the file structure to help with debugging"""
     if parsed_data['type'] == 'pdf':
+        if parsed_data.get('text'):
+            st.write("**PDF Text Preview (first 2000 chars):**")
+            st.text(parsed_data['text'][:2000])
         if parsed_data['tables']:
             st.write(f"**PDF has {len(parsed_data['tables'])} table(s)**")
             for i, tbl in enumerate(parsed_data['tables']):
@@ -99,23 +101,177 @@ def show_file_preview(parsed_data):
                 st.write(f"**Sheet '{name}'** - Columns: {df.columns.tolist()}")
                 st.dataframe(df.head(5), height=150)
 
+def parse_equipment_from_text(text, debug=False):
+    """Parse equipment schedule from PDF text - handles Zeidler/FWG format"""
+    equipment_list = []
+    lines = text.split('\n')
+    
+    if debug:
+        st.write(f"**Total lines in PDF:** {len(lines)}")
+    
+    # Pattern for equipment lines: starts with item number, has description, qty, category
+    # Format: No | EquipNum(optional) | Description | Qty | Category | ... electrical specs
+    # Examples:
+    # "1 9038 STORAGE SHELVING 3 1"
+    # "2 1195.12 WALK-IN FREEZER c/w INSULATED FLOOR 1 5 12A 120V..."
+    # "3 WALK-IN FREEZER EVAPORATOR COIL 1 5 14A 208V..."
+    
+    # Skip lines that are clearly not equipment
+    skip_patterns = [
+        r'^EQUIPMENT LIST', r'^CATEGORY', r'^ELECTRICAL', r'^MECHANICAL',
+        r'^No\.\s', r'^NEW\s', r'^Description', r'^Load', r'^Volts',
+        r'^WATER', r'^WASTE', r'^GAS', r'^EXHAUST', r'^HW', r'^CW',
+        r'^E\d+\s', r'^M\d+\s',  # Notes like E1, M1
+        r'^NOTE:', r'^SUPPLIER CODE', r'^\d+\s+IH SUPPLY', r'^\d+\s+CONTRACTOR',
+        r'^PROJECT', r'^TITLE', r'^DRAWING', r'^REVISION', r'^zeidler',
+        r'^COPYRIGHT', r'^300,', r'^T 403', r'^Zeidler', r'^Interior Health',
+        r'^ISSUED', r'^DATE', r'Autodesk Docs', r'^\s*$',
+        r'^KITCHEN EQUIPMENT', r'^1 : \d+', r'^K-\d+',
+        r'^THIS PLAN', r'^ALL SERVICES', r'^ELECTRICAL CONTRACTOR',
+        r'^MECHANICAL CONTRACTOR', r'^KITCHEN CONTRACTOR',
+        r'^UPON COMPLETION', r'^AT THIS POINT'
+    ]
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Skip header/note lines
+        skip = False
+        for pattern in skip_patterns:
+            if re.match(pattern, line, re.IGNORECASE):
+                skip = True
+                break
+        if skip:
+            continue
+        
+        # Try to match equipment line pattern
+        # Pattern 1: No + EquipNum + Description + ... + Qty + Category (at specific positions)
+        # Pattern 2: No + Description (no equip num) + ... + Qty + Category
+        
+        # First, check if line starts with item number (1, 1a, 2, 3, etc.)
+        item_match = re.match(r'^(\d+[a-z]?)\s+(.+)$', line, re.IGNORECASE)
+        if not item_match:
+            continue
+        
+        item_no = item_match.group(1)
+        rest = item_match.group(2).strip()
+        
+        # Skip if this looks like a note reference (e.g., "1 IH SUPPLY / IH INSTALL")
+        if re.match(r'^IH SUPPLY|^CONTRACTOR|^EXISTING', rest, re.IGNORECASE):
+            continue
+        
+        # Try to extract: [EquipNum] Description Qty Category [electrical specs...]
+        # The category (1-8) and qty appear before electrical specs
+        
+        # Look for the pattern where we have numbers at the end representing Qty and Category
+        # Electrical specs usually start with something like "12A", "120V", "JUNCTION", etc.
+        
+        # Strategy: Find category (1-8) which appears after qty
+        # Pattern: ... Qty Category [ElecSpecs]
+        # Qty is usually 1-9, Category is 1-8
+        
+        # Try matching with equipment number (like 9038, 1195.12, 1302.15)
+        equip_match = re.match(r'^(\d+\.?\d*)\s+(.+)$', rest)
+        
+        if equip_match:
+            equip_num = equip_match.group(1)
+            remainder = equip_match.group(2)
+        else:
+            equip_num = None
+            remainder = rest
+        
+        # Now extract description, qty, category from remainder
+        # Look for pattern: DESCRIPTION QTY CATEGORY [ELECTRICAL...]
+        # Category is 1-8, appears right after qty
+        # Electrical starts with patterns like: \dA, \dV, JUNCTION, RECEPTACLE, etc.
+        
+        # Find where electrical specs might start
+        elec_patterns = [
+            r'\d+A\s+\d+V',  # e.g., "12A 120V"
+            r'\d+\.?\d*KW',  # e.g., "0.3KW"
+            r'JUNCTION',
+            r'RECEPTACLE',
+            r'SEE NOTE',
+            r'TWO SERVICES',
+            r'SERVICES REQ',
+            r'LIGHTS',
+            r'\d+\s+FFD',  # Drain specs
+            r'STUB-UP',
+            r'WASTE TO',
+        ]
+        
+        elec_start = len(remainder)
+        for pattern in elec_patterns:
+            m = re.search(pattern, remainder, re.IGNORECASE)
+            if m and m.start() < elec_start:
+                elec_start = m.start()
+        
+        # Get the part before electrical specs
+        before_elec = remainder[:elec_start].strip()
+        
+        # Now parse: DESCRIPTION QTY CATEGORY
+        # Category is single digit 1-8, Qty is typically 1-9 (or more)
+        # They appear at the end
+        
+        # Try to find qty and category at the end
+        qty_cat_match = re.search(r'\s+(\d+)\s+([1-8]|-)\s*$', before_elec)
+        
+        if qty_cat_match:
+            description = before_elec[:qty_cat_match.start()].strip()
+            qty = int(qty_cat_match.group(1))
+            cat_str = qty_cat_match.group(2)
+            category = int(cat_str) if cat_str != '-' else None
+        else:
+            # Try without category (some items marked as SPARE have "-" for category)
+            qty_match = re.search(r'\s+(\d+)\s*$', before_elec)
+            if qty_match:
+                description = before_elec[:qty_match.start()].strip()
+                qty = int(qty_match.group(1))
+                category = None
+            else:
+                # Can't parse qty, skip
+                if debug:
+                    st.write(f"Could not parse: {line[:80]}...")
+                continue
+        
+        # Clean up description
+        description = re.sub(r'\s+', ' ', description).strip()
+        
+        # Skip if description is too short or looks invalid
+        if len(description) < 3:
+            continue
+        if description.upper() in ['NIC', 'N/A', '-', 'SPARE']:
+            # Still add SPARE items but mark them
+            pass
+        
+        equipment_list.append({
+            'No': item_no,
+            'Description': description,
+            'Qty': qty,
+            'Category': category
+        })
+        
+        if debug and len(equipment_list) <= 5:
+            st.write(f"Parsed: No={item_no}, Desc={description[:40]}..., Qty={qty}, Cat={category}")
+    
+    if debug:
+        st.write(f"**Total equipment items extracted from text:** {len(equipment_list)}")
+    
+    return equipment_list
+
 def extract_equipment_from_dataframe(df, debug=False):
     """Extract equipment items from a dataframe with flexible column detection"""
     equipment_list = []
     original_cols = df.columns.tolist()
-    
-    # Clean up the dataframe - remove completely empty rows
     df = df.dropna(how='all').reset_index(drop=True)
-    
-    # Normalize column names
     df.columns = df.columns.astype(str).str.strip().str.lower()
     
     if debug:
         st.write("**Original columns:**", original_cols)
         st.write("**Normalized columns:**", df.columns.tolist())
-        st.write("**DataFrame shape:**", df.shape)
     
-    # Extended column mapping with more variations
     col_map = {
         'no': ['no', 'no.', 'item', 'item #', 'item no', 'item no.', 'number', '#', 
                'eq no', 'eq no.', 'equipment no', 'equipment no.', 'equip no', 
@@ -129,8 +285,6 @@ def extract_equipment_from_dataframe(df, debug=False):
     }
     
     found = {}
-    
-    # First pass: exact match
     for key, opts in col_map.items():
         for col in df.columns:
             col_clean = col.lower().strip()
@@ -138,7 +292,6 @@ def extract_equipment_from_dataframe(df, debug=False):
                 found[key] = col
                 break
     
-    # Second pass: partial match for unfound columns
     for key, opts in col_map.items():
         if key not in found:
             for col in df.columns:
@@ -150,75 +303,35 @@ def extract_equipment_from_dataframe(df, debug=False):
     if debug:
         st.write("**Found column mapping:**", found)
     
-    # Fallback: try using first columns if standard mapping failed
     if 'no' not in found or 'description' not in found:
         if len(df.columns) >= 2:
             first_col = df.columns[0]
             second_col = df.columns[1]
-            
-            if debug:
-                st.write(f"**Trying fallback:** First col '{first_col}' as No, Second col '{second_col}' as Description")
-            
-            # Check if first column looks like item numbers (e.g., "1", "1a", "23", etc.)
             sample_vals = df[first_col].dropna().head(10).astype(str).tolist()
             looks_like_numbers = any(
                 re.match(r'^\d+[a-zA-Z]?$', str(v).strip()) 
                 for v in sample_vals if str(v).strip()
             )
-            
             if looks_like_numbers:
                 if 'no' not in found:
                     found['no'] = first_col
                 if 'description' not in found:
                     found['description'] = second_col
-                if debug:
-                    st.write("**Fallback accepted** - first column contains item numbers")
-            elif debug:
-                st.write("**Fallback rejected** - first column doesn't look like item numbers")
-                st.write("Sample values:", sample_vals[:5])
-    
-    # Additional fallback: check for any column that looks like it contains item numbers
-    if 'no' not in found:
-        for col in df.columns:
-            sample = df[col].dropna().head(10).astype(str).tolist()
-            if any(re.match(r'^\d+[a-zA-Z]?$', str(v).strip()) for v in sample if str(v).strip()):
-                found['no'] = col
-                if debug:
-                    st.write(f"**Auto-detected 'no' column:** {col}")
-                break
-    
-    # Check for description in remaining columns
-    if 'description' not in found and 'no' in found:
-        for col in df.columns:
-            if col != found['no']:
-                # Check if column has text content (longer strings)
-                sample = df[col].dropna().head(10).astype(str).tolist()
-                avg_len = sum(len(str(v)) for v in sample) / max(len(sample), 1)
-                if avg_len > 10:  # Descriptions are usually longer
-                    found['description'] = col
-                    if debug:
-                        st.write(f"**Auto-detected 'description' column:** {col}")
-                    break
     
     if 'no' not in found or 'description' not in found:
         if debug:
             st.error(f"Missing required columns. Found mapping: {found}")
-            st.info("Need columns for: Item Number (no) and Description")
         return None
     
-    # Extract equipment items
     for idx, row in df.iterrows():
         try:
             no = str(row.get(found.get('no', ''), '')).strip()
             desc = str(row.get(found.get('description', ''), '')).strip()
             
-            # Skip empty/invalid rows
             if not no or no.lower() in ['nan', '', 'none', 'no', 'no.', 'item', 'item no', 'item no.']:
                 continue
             if not desc or desc.lower() in ['nan', '', 'none', 'description', 'desc']:
                 continue
-            
-            # Skip header-like rows
             if no.lower() == found.get('no', '').lower():
                 continue
             
@@ -226,7 +339,7 @@ def extract_equipment_from_dataframe(df, debug=False):
             if 'qty' in found:
                 try:
                     qval = str(row.get(found['qty'], 1)).replace(',', '').strip()
-                    qval = re.sub(r'[^\d.]', '', qval)  # Remove non-numeric chars
+                    qval = re.sub(r'[^\d.]', '', qval)
                     qty = int(float(qval)) if qval and qval.lower() not in ['nan', ''] else 1
                 except:
                     pass
@@ -235,7 +348,7 @@ def extract_equipment_from_dataframe(df, debug=False):
             if 'category' in found:
                 try:
                     cval = str(row.get(found['category'], '')).strip()
-                    cval = re.sub(r'[^\d]', '', cval)  # Extract only digits
+                    cval = re.sub(r'[^\d]', '', cval)
                     cat = int(float(cval)) if cval else None
                 except:
                     pass
@@ -247,11 +360,7 @@ def extract_equipment_from_dataframe(df, debug=False):
             continue
     
     if debug:
-        st.write(f"**Extracted {len(equipment_list)} items**")
-        if equipment_list:
-            st.write("**Sample items:**")
-            for item in equipment_list[:3]:
-                st.write(f"  - {item}")
+        st.write(f"**Extracted {len(equipment_list)} items from dataframe**")
     
     return equipment_list if equipment_list else None
 
@@ -259,16 +368,28 @@ def process_drawing_file(parsed_data, debug=False):
     """Process drawing file and extract equipment list"""
     equipment_list = []
     
-    if parsed_data['type'] == 'pdf' and parsed_data['tables']:
-        if debug:
-            st.write(f"**PDF Tables found:** {len(parsed_data['tables'])}")
-        for i, tbl in enumerate(parsed_data['tables']):
+    # For PDFs, try text parsing first (works better for complex tables)
+    if parsed_data['type'] == 'pdf':
+        if parsed_data.get('text'):
             if debug:
-                st.write(f"**Processing Table {i+1}:**")
-            ext = extract_equipment_from_dataframe(tbl, debug=debug)
-            if ext:
-                equipment_list.extend(ext)
-                
+                st.write("**Attempting text-based extraction...**")
+            text_equip = parse_equipment_from_text(parsed_data['text'], debug=debug)
+            if text_equip and len(text_equip) > 0:
+                equipment_list.extend(text_equip)
+                if debug:
+                    st.success(f"Text extraction found {len(text_equip)} items")
+        
+        # If text parsing didn't work well, try table extraction
+        if len(equipment_list) < 5 and parsed_data.get('tables'):
+            if debug:
+                st.write(f"**Trying table extraction ({len(parsed_data['tables'])} tables)...**")
+            for i, tbl in enumerate(parsed_data['tables']):
+                if debug:
+                    st.write(f"Processing Table {i+1}")
+                ext = extract_equipment_from_dataframe(tbl, debug=debug)
+                if ext:
+                    equipment_list.extend(ext)
+                    
     elif parsed_data['type'] in ['excel', 'csv'] and parsed_data.get('sheets'):
         if debug:
             st.write(f"**Sheets found:** {list(parsed_data['sheets'].keys())}")
@@ -280,7 +401,7 @@ def process_drawing_file(parsed_data, debug=False):
                 equipment_list.extend(ext)
     
     if debug and not equipment_list:
-        st.warning("No equipment extracted from any table/sheet")
+        st.warning("No equipment extracted from any source")
     
     # Remove duplicates
     seen = set()
@@ -498,11 +619,8 @@ with tabs[0]:
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("📐 Drawing / Equipment Schedule")
+        debug_mode = st.checkbox("🔧 Debug Mode (show parsing details)", key="debug_draw")
         
-        # Debug mode toggle
-        debug_mode = st.checkbox("🔧 Debug Mode (show column detection)", key="debug_draw")
-        
-        # Show current status
         if st.session_state.equipment_schedule and len(st.session_state.equipment_schedule) > 0:
             st.success(f"✅ Loaded: {st.session_state.drawing_filename} ({len(st.session_state.equipment_schedule)} items)")
             with st.expander("View Equipment Schedule"):
@@ -513,7 +631,6 @@ with tabs[0]:
             with st.spinner("Processing drawing..."):
                 parsed = parse_uploaded_file(df_file)
                 if parsed:
-                    # Always show preview in debug mode
                     if debug_mode:
                         st.write(f"**File type:** {parsed['type']}")
                         with st.expander("📋 Raw File Preview", expanded=True):
@@ -530,12 +647,11 @@ with tabs[0]:
                         st.error("❌ Could not extract equipment.")
                         st.info("""
 **Tips to fix this:**
-1. Enable **Debug Mode** above to see what columns were detected
-2. Your file needs columns similar to: `No.` or `Item` AND `Description`
-3. Check that your data starts from row 1 (or has a header row)
-4. Try exporting your drawing schedule to CSV/Excel format
+1. Enable **Debug Mode** above to see parsing details
+2. For PDFs: The equipment list should have item numbers (1, 2, 3...) with descriptions
+3. For Excel/CSV: Need columns like `No.` and `Description`
+4. Try exporting your schedule to Excel format
                         """)
-                        # Show preview anyway to help debug
                         if not debug_mode:
                             with st.expander("📋 Click to see file structure"):
                                 show_file_preview(parsed)
@@ -544,8 +660,6 @@ with tabs[0]:
     
     with c2:
         st.subheader("📝 Quotations")
-        
-        # Show current status
         if st.session_state.quotes_data and len(st.session_state.quotes_data) > 0:
             st.success(f"✅ {len(st.session_state.quotes_data)} quote file(s) loaded")
             for fn, qs in st.session_state.quotes_data.items():
@@ -672,4 +786,4 @@ with tabs[4]:
                     st.text(p.extract_text())
 
 st.markdown("---")
-st.markdown("<center>Equipment Quote Analyzer v5.9 | Drawing No. ↔ Quote Item</center>", unsafe_allow_html=True)
+st.markdown("<center>Equipment Quote Analyzer v6.0 | PDF Text Parsing for Zeidler Drawings</center>", unsafe_allow_html=True)
