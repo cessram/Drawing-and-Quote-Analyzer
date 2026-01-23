@@ -470,9 +470,10 @@ with tabs[2]:
         
         st.subheader("📋 Full Report")
         col1, col2 = st.columns(2)
-        filt_status = col1.multiselect("Status", df['Status'].unique().tolist(), default=df['Status'].unique().tolist())
-        filt_cat = col2.multiselect("Supplier Code", sorted([c for c in df['Supplier_Code'].unique() if c]), 
-                                    default=sorted([c for c in df['Supplier_Code'].unique() if c]))
+        status_opts = df['Status'].unique().tolist()
+        filt_status = col1.multiselect("Status", status_opts, default=status_opts)
+        cat_opts = sorted([int(c) for c in df['Supplier_Code'].dropna().unique()])
+        filt_cat = col2.multiselect("Supplier Code", cat_opts, default=cat_opts)
         
         fdf = df[df['Status'].isin(filt_status)]
         if filt_cat:
