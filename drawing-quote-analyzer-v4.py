@@ -386,7 +386,7 @@ with tabs[0]:
                 st.dataframe(pd.DataFrame(st.session_state.equipment_schedule), height=250)
         
         df_file = st.file_uploader("Select Drawing", type=['pdf', 'csv', 'xlsx', 'xls'], key="draw")
-        if df_file:
+        if df_file and df_file.name != st.session_state.drawing_filename:
             with st.spinner("Processing..."):
                 parsed = parse_uploaded_file(df_file)
                 if parsed:
@@ -394,7 +394,6 @@ with tabs[0]:
                     if equip:
                         st.session_state.equipment_schedule = equip
                         st.session_state.drawing_filename = df_file.name
-                        st.success(f"✅ Extracted {len(equip)} items")
                         st.rerun()
                     else:
                         st.error("❌ Could not extract equipment. Check file format.")
