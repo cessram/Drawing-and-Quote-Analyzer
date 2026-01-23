@@ -120,6 +120,29 @@ def get_dataframes_from_parsed(parsed_data):
             dfs.extend(parsed_data['sheets'].values())
     return dfs
 
+def clean_dataframe_columns(df):
+    """Clean DataFrame column names to ensure uniqueness."""
+    df = df.copy()
+    # Convert all column names to strings and strip whitespace
+    df.columns = [str(c).strip() if pd.notna(c) else f'Col_{i}' for i, c in enumerate(df.columns)]
+    
+    # Handle duplicate column names by adding suffix
+    seen = {}
+    new_cols = []
+    for col in df.columns:
+        if col in seen:
+            seen[col] += 1
+            new_cols.append(f"{col}_{seen[col]}")
+        else:
+            seen[col] = 0
+            new_cols.append(col)
+    df.columns = new_cols
+    
+    # Remove completely empty rows
+    df = df.dropna(how='all')
+    
+    return df
+
 def auto_detect_columns(df, file_type='drawing'):
     """Auto-detect column mappings based on common naming patterns."""
     df.columns = df.columns.astype(str).str.strip()
@@ -500,9 +523,11 @@ with tabs[0]:
                             if dfs:
                                 all_items = []
                                 for qdf in dfs:
-                                    col_map = auto_detect_columns(qdf, 'quote')
-                                    items = extract_quote_data(qdf, col_map, qf.name)
-                                    all_items.extend(items)
+                                    qdf = clean_dataframe_columns(qdf)
+                                    if len(qdf) > 0:
+                                        col_map = auto_detect_columns(qdf, 'quote')
+                                        items = extract_quote_data(qdf, col_map, qf.name)
+                                        all_items.extend(items)
                                 
                                 if all_items:
                                     st.session_state.quotes_data[qf.name] = all_items
@@ -767,4 +792,4 @@ with tabs[4]:
         )
 
 st.markdown("---")
-st.caption("Universal Drawing Quote Analyzer v7.0")
+st.caption("Universal Drawing Quote Analyzer v7.1")
