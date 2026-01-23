@@ -41,6 +41,29 @@ if 'supplier_codes' not in st.session_state:
 if 'use_categories' not in st.session_state:
     st.session_state.use_categories = True
 
+def clean_dataframe_columns(df):
+    """Clean DataFrame column names to ensure uniqueness."""
+    df = df.copy()
+    new_cols = []
+    seen = {}
+    
+    for i, c in enumerate(df.columns):
+        # Convert to string and clean
+        col_name = str(c).strip() if pd.notna(c) and str(c).strip() != '' else f'Column_{i}'
+        
+        # Handle duplicates
+        if col_name in seen:
+            seen[col_name] += 1
+            col_name = f"{col_name}_{seen[col_name]}"
+        else:
+            seen[col_name] = 0
+        
+        new_cols.append(col_name)
+    
+    df.columns = new_cols
+    df = df.dropna(how='all')
+    return df
+
 def parse_pdf_to_text(uploaded_file):
     """Extract text from PDF."""
     if not PDF_SUPPORT:
@@ -53,7 +76,8 @@ def parse_pdf_to_text(uploaded_file):
                 text = page.extract_text()
                 if text:
                     text_content.append(text)
-    except:
+    except Exception as e:
+        st.warning(f"Could not extract text from PDF: {e}")
         return None
     return "\n".join(text_content)
 
@@ -69,83 +93,59 @@ def parse_pdf_tables(uploaded_file):
                 tables = page.extract_tables()
                 for table in tables:
                     if table and len(table) > 1:
-                        df = pd.DataFrame(table[1:], columns=table[0])
-                        df = df.dropna(how='all')
+                        # Create DataFrame with first row as header
+                        headers = [str(h).strip() if h else f'Col_{i}' for i, h in enumerate(table[0])]
+                        df = pd.DataFrame(table[1:], columns=headers)
+                        df = clean_dataframe_columns(df)
                         if len(df) > 0:
                             all_tables.append(df)
-    except:
+    except Exception as e:
+        st.warning(f"Could not extract tables from PDF: {e}")
         return None
     return all_tables if all_tables else None
 
 def parse_excel_file(uploaded_file):
-    """Parse Excel file to dict of DataFrames."""
+    """Parse Excel file to list of DataFrames."""
     try:
         uploaded_file.seek(0)
         xl = pd.ExcelFile(uploaded_file)
-        return {name: pd.read_excel(xl, sheet_name=name) for name in xl.sheet_names}
-    except:
+        dfs = []
+        for name in xl.sheet_names:
+            df = pd.read_excel(xl, sheet_name=name)
+            df = clean_dataframe_columns(df)
+            if len(df) > 0:
+                dfs.append(df)
+        return dfs
+    except Exception as e:
+        st.warning(f"Could not read Excel file: {e}")
         return None
 
 def parse_csv_file(uploaded_file):
     """Parse CSV file to DataFrame."""
     try:
         uploaded_file.seek(0)
-        return {"Sheet1": pd.read_csv(uploaded_file)}
-    except:
+        df = pd.read_csv(uploaded_file)
+        df = clean_dataframe_columns(df)
+        return [df] if len(df) > 0 else None
+    except Exception as e:
+        st.warning(f"Could not read CSV file: {e}")
         return None
 
 def parse_uploaded_file(uploaded_file):
-    """Parse any supported file type."""
+    """Parse any supported file type and return list of DataFrames."""
     ext = uploaded_file.name.split('.')[-1].lower()
+    
     if ext == 'pdf':
         tables = parse_pdf_tables(uploaded_file)
-        text = parse_pdf_to_text(uploaded_file)
-        return {'type': 'pdf', 'tables': tables, 'text': text, 'filename': uploaded_file.name}
+        return tables
     elif ext in ['xlsx', 'xls']:
-        sheets = parse_excel_file(uploaded_file)
-        return {'type': 'excel', 'sheets': sheets, 'filename': uploaded_file.name}
+        return parse_excel_file(uploaded_file)
     elif ext == 'csv':
-        sheets = parse_csv_file(uploaded_file)
-        return {'type': 'csv', 'sheets': sheets, 'filename': uploaded_file.name}
+        return parse_csv_file(uploaded_file)
     return None
-
-def get_dataframes_from_parsed(parsed_data):
-    """Convert parsed data to list of DataFrames."""
-    dfs = []
-    if parsed_data['type'] == 'pdf':
-        if parsed_data.get('tables'):
-            dfs.extend(parsed_data['tables'])
-    elif parsed_data['type'] in ['excel', 'csv']:
-        if parsed_data.get('sheets'):
-            dfs.extend(parsed_data['sheets'].values())
-    return dfs
-
-def clean_dataframe_columns(df):
-    """Clean DataFrame column names to ensure uniqueness."""
-    df = df.copy()
-    # Convert all column names to strings and strip whitespace
-    df.columns = [str(c).strip() if pd.notna(c) else f'Col_{i}' for i, c in enumerate(df.columns)]
-    
-    # Handle duplicate column names by adding suffix
-    seen = {}
-    new_cols = []
-    for col in df.columns:
-        if col in seen:
-            seen[col] += 1
-            new_cols.append(f"{col}_{seen[col]}")
-        else:
-            seen[col] = 0
-            new_cols.append(col)
-    df.columns = new_cols
-    
-    # Remove completely empty rows
-    df = df.dropna(how='all')
-    
-    return df
 
 def auto_detect_columns(df, file_type='drawing'):
     """Auto-detect column mappings based on common naming patterns."""
-    df.columns = df.columns.astype(str).str.strip()
     cols_lower = {c: c.lower().strip() for c in df.columns}
     
     if file_type == 'drawing':
@@ -154,7 +154,7 @@ def auto_detect_columns(df, file_type='drawing'):
             'description': ['description', 'desc', 'equipment', 'name', 'item description', 'material'],
             'qty': ['qty', 'qty.', 'quantity', 'count', 'amount', 'units'],
             'category': ['category', 'cat', 'supplier code', 'code', 'type', 'supply'],
-            'equip_num': ['equipment number', 'equip num', 'equip no', 'equip #', 'model', 'part no', 'part #'],
+            'equip_num': ['equipment number', 'equip num', 'equip no', 'equip #', 'model', 'part no', 'part #', 'new equipment'],
             'unit': ['unit', 'uom', 'measure'],
             'remarks': ['remarks', 'notes', 'comment', 'comments']
         }
@@ -416,19 +416,18 @@ with tabs[0]:
         if draw_file:
             if draw_file.name != st.session_state.drawing_filename:
                 with st.spinner("Processing drawing..."):
-                    parsed = parse_uploaded_file(draw_file)
-                    if parsed:
-                        dfs = get_dataframes_from_parsed(parsed)
-                        if dfs:
-                            # Combine all tables/sheets
-                            combined = pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
-                            combined = combined.dropna(how='all').reset_index(drop=True)
-                            st.session_state.drawing_df = combined
-                            st.session_state.drawing_filename = draw_file.name
-                            st.session_state.column_mapping = auto_detect_columns(combined, 'drawing')
-                            st.session_state.drawing_data = None
-                        else:
-                            st.error("Could not extract data from file")
+                    dfs = parse_uploaded_file(draw_file)
+                    if dfs and len(dfs) > 0:
+                        # Select the largest DataFrame (most likely main data)
+                        combined = max(dfs, key=len)
+                        combined = combined.reset_index(drop=True)
+                        st.session_state.drawing_df = combined
+                        st.session_state.drawing_filename = draw_file.name
+                        st.session_state.column_mapping = auto_detect_columns(combined, 'drawing')
+                        st.session_state.drawing_data = None
+                        st.rerun()
+                    else:
+                        st.error("Could not extract data from file")
     
     with col2:
         if st.session_state.drawing_filename:
@@ -517,21 +516,17 @@ with tabs[0]:
             for qf in quote_files:
                 if qf.name not in st.session_state.quotes_data:
                     with st.spinner(f"Processing {qf.name}..."):
-                        parsed = parse_uploaded_file(qf)
-                        if parsed:
-                            dfs = get_dataframes_from_parsed(parsed)
-                            if dfs:
-                                all_items = []
-                                for qdf in dfs:
-                                    qdf = clean_dataframe_columns(qdf)
-                                    if len(qdf) > 0:
-                                        col_map = auto_detect_columns(qdf, 'quote')
-                                        items = extract_quote_data(qdf, col_map, qf.name)
-                                        all_items.extend(items)
-                                
-                                if all_items:
-                                    st.session_state.quotes_data[qf.name] = all_items
-                                    st.success(f"✅ {len(all_items)} items from {qf.name}")
+                        dfs = parse_uploaded_file(qf)
+                        if dfs and len(dfs) > 0:
+                            all_items = []
+                            for qdf in dfs:
+                                col_map = auto_detect_columns(qdf, 'quote')
+                                items = extract_quote_data(qdf, col_map, qf.name)
+                                all_items.extend(items)
+                            
+                            if all_items:
+                                st.session_state.quotes_data[qf.name] = all_items
+                                st.success(f"✅ {len(all_items)} items from {qf.name}")
     
     with qcol2:
         if st.session_state.quotes_data:
@@ -546,9 +541,11 @@ with tabs[0]:
     
     st.markdown("---")
     if st.button("🔄 Reset Everything"):
-        for key in ['drawing_data', 'drawing_df', 'quotes_data', 'drawing_filename', 'column_mapping']:
-            if key in st.session_state:
-                st.session_state[key] = None if key != 'quotes_data' else {}
+        st.session_state.drawing_data = None
+        st.session_state.drawing_df = None
+        st.session_state.quotes_data = {}
+        st.session_state.drawing_filename = None
+        st.session_state.column_mapping = {}
         st.rerun()
 
 # ===== TAB 2: Dashboard =====
@@ -792,4 +789,4 @@ with tabs[4]:
         )
 
 st.markdown("---")
-st.caption("Universal Drawing Quote Analyzer v7.1")
+st.caption("Universal Drawing Quote Analyzer v7.2")
