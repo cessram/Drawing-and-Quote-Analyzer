@@ -11,46 +11,74 @@ try:
 except ImportError:
     PDF_SUPPORT = False
 
-st.set_page_config(page_title="Drawing Quote Analyzer", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="Drawing Quote Analyzer", page_icon="📊", layout="wide")
 
-SUPPLIER_CODES = {
-    1: "IH SUPPLY / IH INSTALL",
-    2: "IH SUPPLY / IH INSTALL (DH EQUIPMENT)",
-    3: "IH SUPPLY / IH INSTALL (BIO MED)",
-    4: "IH SUPPLY / VENDOR INSTALL",
-    5: "CONTRACTOR SUPPLY / CONTRACTOR INSTALL",
-    6: "CONTRACTOR SUPPLY / VENDOR INSTALL",
-    7: "IH SUPPLY / CONTRACTOR INSTALL",
-    8: "EXISTING / RELOCATED EQUIPMENT"
+# Default supplier codes (can be customized)
+DEFAULT_SUPPLIER_CODES = {
+    1: "Owner Supply / Owner Install",
+    2: "Owner Supply / Owner Install (Special)",
+    3: "Owner Supply / Owner Install (Other)",
+    4: "Owner Supply / Vendor Install",
+    5: "Contractor Supply / Contractor Install",
+    6: "Contractor Supply / Vendor Install",
+    7: "Owner Supply / Contractor Install",
+    8: "Existing / Relocated"
 }
 
-SKIP_WORDS = ['equipment list', 'electrical services', 'mechanical services', 
-    'project', 'title', 'drawing', 'revision', 'zeidler', 'copyright', 
-    'issued', 'date', 'kitchen equipment fixture', 'this plan', 'all services', 
-    'electrical contractor', 'mechanical contractor', 'kitchen contractor',
-    'upon completion', 'at this point', 'project address', 'supplier code',
-    'interior health', 'autodesk docs', 'conn. type', 'elec. ri']
-
-if 'equipment_schedule' not in st.session_state:
-    st.session_state.equipment_schedule = None
+# Initialize session state
+if 'drawing_data' not in st.session_state:
+    st.session_state.drawing_data = None
+if 'drawing_df' not in st.session_state:
+    st.session_state.drawing_df = None
 if 'quotes_data' not in st.session_state:
     st.session_state.quotes_data = {}
 if 'drawing_filename' not in st.session_state:
     st.session_state.drawing_filename = None
+if 'column_mapping' not in st.session_state:
+    st.session_state.column_mapping = {}
+if 'supplier_codes' not in st.session_state:
+    st.session_state.supplier_codes = DEFAULT_SUPPLIER_CODES.copy()
+if 'use_categories' not in st.session_state:
+    st.session_state.use_categories = True
 
-def parse_pdf_file(uploaded_file):
+def parse_pdf_to_text(uploaded_file):
+    """Extract text from PDF."""
     if not PDF_SUPPORT:
         return None
     text_content = []
     uploaded_file.seek(0)
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                text_content.append(text)
+    try:
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    text_content.append(text)
+    except:
+        return None
     return "\n".join(text_content)
 
+def parse_pdf_tables(uploaded_file):
+    """Extract tables from PDF."""
+    if not PDF_SUPPORT:
+        return None
+    uploaded_file.seek(0)
+    all_tables = []
+    try:
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in tables:
+                    if table and len(table) > 1:
+                        df = pd.DataFrame(table[1:], columns=table[0])
+                        df = df.dropna(how='all')
+                        if len(df) > 0:
+                            all_tables.append(df)
+    except:
+        return None
+    return all_tables if all_tables else None
+
 def parse_excel_file(uploaded_file):
+    """Parse Excel file to dict of DataFrames."""
     try:
         uploaded_file.seek(0)
         xl = pd.ExcelFile(uploaded_file)
@@ -59,6 +87,7 @@ def parse_excel_file(uploaded_file):
         return None
 
 def parse_csv_file(uploaded_file):
+    """Parse CSV file to DataFrame."""
     try:
         uploaded_file.seek(0)
         return {"Sheet1": pd.read_csv(uploaded_file)}
@@ -66,10 +95,12 @@ def parse_csv_file(uploaded_file):
         return None
 
 def parse_uploaded_file(uploaded_file):
+    """Parse any supported file type."""
     ext = uploaded_file.name.split('.')[-1].lower()
     if ext == 'pdf':
-        text = parse_pdf_file(uploaded_file)
-        return {'type': 'pdf', 'text': text, 'filename': uploaded_file.name}
+        tables = parse_pdf_tables(uploaded_file)
+        text = parse_pdf_to_text(uploaded_file)
+        return {'type': 'pdf', 'tables': tables, 'text': text, 'filename': uploaded_file.name}
     elif ext in ['xlsx', 'xls']:
         sheets = parse_excel_file(uploaded_file)
         return {'type': 'excel', 'sheets': sheets, 'filename': uploaded_file.name}
@@ -78,162 +109,117 @@ def parse_uploaded_file(uploaded_file):
         return {'type': 'csv', 'sheets': sheets, 'filename': uploaded_file.name}
     return None
 
-def parse_equipment_from_text(text):
-    equipment_list = []
-    lines = text.split('\n')
-    
-    for line in lines:
-        line = line.strip()
-        if not line or len(line) < 8:
-            continue
-        
-        line_lower = line.lower()
-        skip = False
-        for sw in SKIP_WORDS:
-            if sw in line_lower:
-                skip = True
-                break
-        if skip:
-            continue
-        
-        if line.startswith(('No.', 'NEW ', '1 :', 'K-', '300,', 'T 403', 'E1 ', 'E2 ', 'M1 ', 'M2 ')):
-            continue
-        
-        match = re.match(r'^(\d{1,2}[a-z]?)\s+(.+)$', line, re.IGNORECASE)
-        if not match:
-            continue
-        
-        item_no = match.group(1)
-        rest = match.group(2).strip()
-        
-        try:
-            num_only = re.sub(r'[a-z]', '', item_no, flags=re.IGNORECASE)
-            if int(num_only) > 90:
-                continue
-        except:
-            continue
-        
-        if re.match(r'^(IH SUPPLY|CONTRACTOR|EXISTING)', rest, re.IGNORECASE):
-            continue
-        
-        equip_num = '-'
-        eq_match = re.match(r'^(\d{4,}\.?\d*)\s+(.+)$', rest)
-        if eq_match:
-            equip_num = eq_match.group(1)
-            rest = eq_match.group(2).strip()
-        
-        if rest.startswith('- '):
-            equip_num = '-'
-            rest = rest[2:].strip()
-        
-        elec_match = re.search(r'(\d+A\s+\d+V|\d+KW|JUNCTION|RECEPTACLE|SEE NOTE|SERVICES|LIGHTS|FFD|STUB-UP|WASTE TO)', rest, re.IGNORECASE)
-        if elec_match:
-            rest = rest[:elec_match.start()].strip()
-        
-        qty_cat = re.search(r'\s+(\d+)\s+([1-8])\s*$', rest)
-        qty_dash = re.search(r'\s+(\d+)\s+(-)\s*$', rest)
-        
-        if qty_cat:
-            description = rest[:qty_cat.start()].strip()
-            qty = int(qty_cat.group(1))
-            category = int(qty_cat.group(2))
-        elif qty_dash:
-            description = rest[:qty_dash.start()].strip()
-            qty = int(qty_dash.group(1))
-            category = None
-        else:
-            continue
-        
-        description = ' '.join(description.split())
-        if len(description) < 2:
-            continue
-        
-        if description.upper() in ('SPARE', '-'):
-            description = 'SPARE'
-        
-        equipment_list.append({
-            'No': item_no,
-            'New_Equip_Num': equip_num,
-            'Description': description,
-            'Qty': qty,
-            'Category': category
-        })
-    
-    return equipment_list
+def get_dataframes_from_parsed(parsed_data):
+    """Convert parsed data to list of DataFrames."""
+    dfs = []
+    if parsed_data['type'] == 'pdf':
+        if parsed_data.get('tables'):
+            dfs.extend(parsed_data['tables'])
+    elif parsed_data['type'] in ['excel', 'csv']:
+        if parsed_data.get('sheets'):
+            dfs.extend(parsed_data['sheets'].values())
+    return dfs
 
-def extract_equipment_from_dataframe(df):
-    equipment_list = []
-    df = df.dropna(how='all').reset_index(drop=True)
-    df.columns = df.columns.astype(str).str.strip().str.lower()
+def auto_detect_columns(df, file_type='drawing'):
+    """Auto-detect column mappings based on common naming patterns."""
+    df.columns = df.columns.astype(str).str.strip()
+    cols_lower = {c: c.lower().strip() for c in df.columns}
     
-    col_map = {
-        'no': ['no', 'no.', 'item', 'item #', 'item no', 'number', '#'],
-        'new_equip_num': ['new equipment number', 'equipment number', 'equip num', 'equip no'],
-        'description': ['description', 'desc', 'equipment', 'name'],
-        'qty': ['qty', 'qty.', 'quantity', 'count'],
-        'category': ['category', 'cat', 'supplier code', 'code']
-    }
+    if file_type == 'drawing':
+        patterns = {
+            'no': ['no', 'no.', 'item', 'item #', 'item no', 'number', '#', 'id', 'ref'],
+            'description': ['description', 'desc', 'equipment', 'name', 'item description', 'material'],
+            'qty': ['qty', 'qty.', 'quantity', 'count', 'amount', 'units'],
+            'category': ['category', 'cat', 'supplier code', 'code', 'type', 'supply'],
+            'equip_num': ['equipment number', 'equip num', 'equip no', 'equip #', 'model', 'part no', 'part #'],
+            'unit': ['unit', 'uom', 'measure'],
+            'remarks': ['remarks', 'notes', 'comment', 'comments']
+        }
+    else:  # quote
+        patterns = {
+            'no': ['no', 'no.', 'item', 'item #', 'item no', 'number', '#', 'id', 'ref', 'line'],
+            'description': ['description', 'desc', 'equipment', 'name', 'item description', 'material', 'product'],
+            'qty': ['qty', 'qty.', 'quantity', 'count', 'amount', 'units'],
+            'unit_price': ['unit price', 'price', 'sell', 'rate', 'unit cost', 'cost ea', 'each'],
+            'total_price': ['total', 'total price', 'sell total', 'ext price', 'extended', 'amount', 'line total'],
+            'unit': ['unit', 'uom', 'measure']
+        }
     
     found = {}
-    for key, opts in col_map.items():
-        for col in df.columns:
-            col_clean = col.lower().strip()
-            if col_clean in opts:
+    for key, opts in patterns.items():
+        for col, col_low in cols_lower.items():
+            if col_low in opts:
                 found[key] = col
                 break
-            for o in opts:
-                if o in col_clean:
+            for opt in opts:
+                if opt in col_low:
                     found[key] = col
                     break
+            if key in found:
+                break
     
-    if 'no' not in found or 'description' not in found:
-        if len(df.columns) >= 3:
-            found['no'] = df.columns[0]
-            found['new_equip_num'] = df.columns[1]
-            found['description'] = df.columns[2]
+    return found
+
+def clean_numeric(val):
+    """Clean numeric value from string."""
+    if pd.isna(val):
+        return None
+    val_str = str(val).strip()
+    val_str = re.sub(r'[,$]', '', val_str)
+    val_str = re.sub(r'[^\d.\-]', '', val_str)
+    try:
+        return float(val_str) if val_str else None
+    except:
+        return None
+
+def extract_drawing_data(df, col_map):
+    """Extract drawing data using column mapping."""
+    items = []
     
-    if 'no' not in found or 'description' not in found:
+    no_col = col_map.get('no')
+    desc_col = col_map.get('description')
+    qty_col = col_map.get('qty')
+    cat_col = col_map.get('category')
+    equip_col = col_map.get('equip_num')
+    
+    if not no_col or not desc_col:
         return None
     
     for idx, row in df.iterrows():
         try:
-            no_val = str(row.get(found['no'], '')).strip()
-            desc_val = str(row.get(found['description'], '')).strip()
+            no_val = str(row.get(no_col, '')).strip()
+            desc_val = str(row.get(desc_col, '')).strip()
             
-            if not no_val or no_val.lower() in ('nan', '', 'no', 'no.', 'item'):
+            # Skip header rows and empty rows
+            if not no_val or no_val.lower() in ('nan', '', 'no', 'no.', 'item', 'none'):
                 continue
-            if not desc_val or desc_val.lower() in ('nan', '', 'description'):
+            if not desc_val or desc_val.lower() in ('nan', '', 'description', 'none'):
                 continue
             
+            # Get quantity
+            qty = 1
+            if qty_col:
+                qty_val = clean_numeric(row.get(qty_col, 1))
+                if qty_val:
+                    qty = int(qty_val)
+            
+            # Get category
+            cat = None
+            if cat_col:
+                cat_val = clean_numeric(row.get(cat_col, ''))
+                if cat_val:
+                    cat = int(cat_val)
+            
+            # Get equipment number
             equip_num = '-'
-            if 'new_equip_num' in found:
-                en = str(row.get(found['new_equip_num'], '')).strip()
-                if en and en.lower() not in ('nan', ''):
+            if equip_col:
+                en = str(row.get(equip_col, '')).strip()
+                if en and en.lower() not in ('nan', '', '-', 'none'):
                     equip_num = en
             
-            qty = 1
-            if 'qty' in found:
-                try:
-                    qv = str(row.get(found['qty'], 1))
-                    qv = re.sub(r'[^\d.]', '', qv)
-                    if qv:
-                        qty = int(float(qv))
-                except:
-                    pass
-            
-            cat = None
-            if 'category' in found:
-                try:
-                    cv = str(row.get(found['category'], ''))
-                    cv = re.sub(r'[^\d]', '', cv)
-                    if cv:
-                        cat = int(float(cv))
-                except:
-                    pass
-            
-            equipment_list.append({
+            items.append({
                 'No': no_val,
-                'New_Equip_Num': equip_num,
+                'Equip_Num': equip_num,
                 'Description': desc_val,
                 'Qty': qty,
                 'Category': cat
@@ -241,211 +227,109 @@ def extract_equipment_from_dataframe(df):
         except:
             continue
     
-    return equipment_list if equipment_list else None
+    return items if items else None
 
-def process_drawing_file(parsed_data):
-    equipment_list = []
+def extract_quote_data(df, col_map, source_file):
+    """Extract quote data using column mapping."""
+    items = []
     
-    if parsed_data['type'] == 'pdf' and parsed_data.get('text'):
-        equipment_list = parse_equipment_from_text(parsed_data['text'])
-    elif parsed_data['type'] in ['excel', 'csv'] and parsed_data.get('sheets'):
-        for df in parsed_data['sheets'].values():
-            ext = extract_equipment_from_dataframe(df)
-            if ext:
-                equipment_list.extend(ext)
-    
-    seen = set()
-    unique = []
-    for item in equipment_list:
-        if item['No'] not in seen:
-            seen.add(item['No'])
-            unique.append(item)
-    return unique
-
-def parse_quote_from_text(text, filename):
-    quotes = []
-    current_item = None
-    current_desc = None
-    current_qty = 0
-    current_unit = 0
-    current_total = 0
-    
-    skip_words = ['page ', 'canadian restaurant', 'bird construc', 'fwg ltc', 
-                  'item qty description', 'sell total', 'merchandise', 'prices are in', 'quote valid']
-    
-    for line in text.split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-        
-        ll = line.lower()
-        skip = False
-        for s in skip_words:
-            if s in ll:
-                skip = True
-                break
-        if skip:
-            continue
-        
-        if re.match(r'^[\d\-]+[a-z]?\s+NIC', line, re.IGNORECASE):
-            continue
-        
-        total_m = re.search(r'ITEM\s*TOTAL[:\s]*\$?([\d,]+\.\d{2})', line, re.IGNORECASE)
-        if total_m and current_item:
-            current_total = float(total_m.group(1).replace(',', ''))
-            if not current_unit and current_qty > 0:
-                current_unit = current_total / current_qty
-            continue
-        
-        m = re.match(r'^(\d+[a-z]?)\s+(\d+)\s*ea\s+(.+)$', line, re.IGNORECASE)
-        if m:
-            if current_item and current_desc:
-                quotes.append({
-                    'Item_No': current_item, 
-                    'Description': current_desc.strip(), 
-                    'Qty': current_qty,
-                    'Unit_Price': current_unit, 
-                    'Total_Price': current_total if current_total else current_unit * current_qty, 
-                    'Source_File': filename
-                })
-            current_item = m.group(1)
-            current_qty = int(m.group(2))
-            rest = m.group(3).strip()
-            prices = re.findall(r'\$?([\d,]+\.\d{2})', rest)
-            current_desc = re.sub(r'\s*\$?[\d,]+\.\d{2}', '', rest).strip()
-            current_unit = float(prices[0].replace(',', '')) if prices else 0
-            current_total = float(prices[1].replace(',', '')) if len(prices) >= 2 else current_unit * current_qty
-    
-    if current_item and current_desc:
-        quotes.append({
-            'Item_No': current_item, 
-            'Description': current_desc.strip(), 
-            'Qty': current_qty,
-            'Unit_Price': current_unit, 
-            'Total_Price': current_total if current_total else current_unit * current_qty, 
-            'Source_File': filename
-        })
-    return quotes
-
-def extract_quotes_from_dataframe(df, filename):
-    quotes = []
-    df.columns = df.columns.astype(str).str.strip().str.lower()
-    
-    col_map = {
-        'item': ['item', 'item no', 'no', 'no.'], 
-        'description': ['description', 'desc', 'equipment', 'name'],
-        'qty': ['qty', 'quantity'], 
-        'unit_price': ['sell', 'unit price', 'price'], 
-        'total_price': ['sell total', 'total', 'total price', 'amount']
-    }
-    
-    found = {}
-    for k, opts in col_map.items():
-        for c in df.columns:
-            if c.lower().strip() in opts:
-                found[k] = c
-                break
+    no_col = col_map.get('no')
+    desc_col = col_map.get('description')
+    qty_col = col_map.get('qty')
+    unit_col = col_map.get('unit_price')
+    total_col = col_map.get('total_price')
     
     for idx, row in df.iterrows():
         try:
-            desc = str(row.get(found.get('description', ''), '')).strip()
-            if not desc or desc.lower() in ('nan', '', 'nic'):
+            desc_val = str(row.get(desc_col, '')).strip() if desc_col else ''
+            
+            # Skip empty/header rows
+            if desc_col and (not desc_val or desc_val.lower() in ('nan', '', 'description', 'none', 'nic')):
                 continue
             
-            item = str(row.get(found.get('item', ''), '')).strip()
+            no_val = ''
+            if no_col:
+                no_val = str(row.get(no_col, '')).strip()
+                if no_val.lower() in ('nan', 'none'):
+                    no_val = ''
             
             qty = 1
-            if 'qty' in found:
-                try:
-                    qv = str(row.get(found['qty'], 1)).replace('ea', '').replace(',', '').strip()
-                    if qv:
-                        qty = int(float(qv))
-                except:
-                    pass
+            if qty_col:
+                qty_val = clean_numeric(row.get(qty_col, 1))
+                if qty_val:
+                    qty = int(qty_val)
             
-            up = 0
-            if 'unit_price' in found:
-                try:
-                    uv = str(row.get(found['unit_price'], 0)).replace('$', '').replace(',', '').strip()
-                    if uv:
-                        up = float(uv)
-                except:
-                    pass
+            unit_price = 0
+            if unit_col:
+                up = clean_numeric(row.get(unit_col, 0))
+                if up:
+                    unit_price = up
             
-            tp = 0
-            if 'total_price' in found:
-                try:
-                    tv = str(row.get(found['total_price'], 0)).replace('$', '').replace(',', '').strip()
-                    if tv:
-                        tp = float(tv)
-                except:
-                    pass
+            total_price = 0
+            if total_col:
+                tp = clean_numeric(row.get(total_col, 0))
+                if tp:
+                    total_price = tp
             
-            if tp == 0:
-                tp = up * qty
+            if total_price == 0 and unit_price > 0:
+                total_price = unit_price * qty
             
-            quotes.append({
-                'Item_No': item, 
-                'Description': desc, 
-                'Qty': qty, 
-                'Unit_Price': up, 
-                'Total_Price': tp, 
-                'Source_File': filename
+            items.append({
+                'Item_No': no_val,
+                'Description': desc_val,
+                'Qty': qty,
+                'Unit_Price': unit_price,
+                'Total_Price': total_price,
+                'Source_File': source_file
             })
         except:
             continue
-    return quotes
-
-def process_quote_file(parsed_data):
-    quotes = []
-    if parsed_data['type'] == 'pdf' and parsed_data.get('text'):
-        quotes = parse_quote_from_text(parsed_data['text'], parsed_data['filename'])
-    elif parsed_data['type'] in ['excel', 'csv'] and parsed_data.get('sheets'):
-        for df in parsed_data['sheets'].values():
-            quotes.extend(extract_quotes_from_dataframe(df, parsed_data['filename']))
     
-    seen = set()
-    unique = []
-    for q in quotes:
-        if q['Item_No'] and q['Item_No'] not in seen:
-            seen.add(q['Item_No'])
-            unique.append(q)
-    return unique
+    return items
 
-def match_quote_to_drawing(drawing_item, quotes):
-    drawing_no = str(drawing_item['No']).strip().lower()
+def match_items(drawing_no, quotes):
+    """Match drawing item to quote by item number."""
+    drawing_no_clean = str(drawing_no).strip().lower()
     
+    # Exact match
     for q in quotes:
-        if str(q.get('Item_No', '')).strip().lower() == drawing_no:
+        if str(q.get('Item_No', '')).strip().lower() == drawing_no_clean:
             return q
     
+    # Numeric match (ignore letters)
     try:
-        drawing_num = int(re.sub(r'[a-zA-Z]', '', drawing_no))
+        drawing_num = int(re.sub(r'[^0-9]', '', drawing_no_clean))
         for q in quotes:
             try:
-                quote_num = int(re.sub(r'[a-zA-Z]', '', str(q.get('Item_No', '')).strip()))
+                quote_num = int(re.sub(r'[^0-9]', '', str(q.get('Item_No', '')).strip()))
                 if drawing_num == quote_num:
                     return q
             except:
                 pass
     except:
         pass
+    
     return None
 
-def analyze_drawing_vs_quotes(drawing_schedule, quotes):
+def analyze_data(drawing_items, quotes, use_categories=True, supplier_codes=None):
+    """Analyze drawing items against quotes."""
+    if supplier_codes is None:
+        supplier_codes = DEFAULT_SUPPLIER_CODES
+    
     analysis = []
     
-    for item in drawing_schedule:
-        match = match_quote_to_drawing(item, quotes)
+    for item in drawing_items:
+        match = match_items(item['No'], quotes)
         cat = item.get('Category')
         
-        if cat in [1, 2, 3]:
-            status = "IH Supply"
-            issue = "IH handles supply and install"
-        elif cat == 8:
+        # Determine status
+        if use_categories and cat in [1, 2, 3]:
+            status = "Owner Supply"
+            issue = supplier_codes.get(cat, "Owner handles")
+        elif use_categories and cat == 8:
             status = "Existing"
             issue = "Existing or relocated"
-        elif cat is None or item.get('Description', '').upper() == 'SPARE':
+        elif item.get('Description', '').upper() in ('SPARE', '-', 'N/A'):
             status = "N/A"
             issue = "Spare or placeholder"
         elif match:
@@ -454,12 +338,12 @@ def analyze_drawing_vs_quotes(drawing_schedule, quotes):
                 issue = None
             else:
                 status = "Qty Mismatch"
-                issue = "Drawing: " + str(item['Qty']) + " Quote: " + str(match['Qty'])
+                issue = f"Drawing: {item['Qty']}, Quote: {match['Qty']}"
         else:
-            if cat == 7:
-                status = "Needs Install"
-                issue = "IH supplies - needs install pricing"
-            elif cat in [5, 6]:
+            if use_categories and cat == 7:
+                status = "Needs Pricing"
+                issue = "Owner supplies - needs install pricing"
+            elif use_categories and cat in [5, 6]:
                 status = "MISSING"
                 issue = "Critical - requires quote"
             else:
@@ -468,11 +352,11 @@ def analyze_drawing_vs_quotes(drawing_schedule, quotes):
         
         analysis.append({
             'Drawing_No': item['No'],
-            'New_Equip_Num': item.get('New_Equip_Num', '-'),
+            'Equip_Num': item.get('Equip_Num', '-'),
             'Description': item['Description'],
             'Drawing_Qty': item['Qty'],
             'Category': cat,
-            'Category_Desc': SUPPLIER_CODES.get(cat, 'N/A') if cat else 'N/A',
+            'Category_Desc': supplier_codes.get(cat, '-') if cat and use_categories else '-',
             'Quote_Item_No': match['Item_No'] if match else '-',
             'Quote_Qty': match['Qty'] if match else 0,
             'Unit_Price': match['Unit_Price'] if match else 0,
@@ -481,196 +365,406 @@ def analyze_drawing_vs_quotes(drawing_schedule, quotes):
             'Status': status,
             'Issue': issue
         })
+    
     return pd.DataFrame(analysis)
 
-# UI
-st.markdown("## Drawing vs Quote Analyzer")
+# ===== UI =====
+st.markdown("## 📊 Drawing vs Quote Analyzer")
+st.caption("Universal tool for comparing drawings/schedules against vendor quotations")
 
 if not PDF_SUPPORT:
-    st.warning("Install pdfplumber: pip install pdfplumber")
+    st.warning("⚠️ PDF support unavailable. Install pdfplumber: `pip install pdfplumber`")
 
-tabs = st.tabs(["Upload", "Dashboard", "Analysis", "Summary", "Export"])
+tabs = st.tabs(["📁 Upload & Configure", "📊 Dashboard", "🔍 Analysis", "📋 Summary", "💾 Export"])
 
+# ===== TAB 1: Upload & Configure =====
 with tabs[0]:
-    c1, c2 = st.columns(2)
+    st.subheader("1️⃣ Upload Drawing/Schedule")
     
-    with c1:
-        st.subheader("Drawing")
-        if st.session_state.equipment_schedule:
-            count = len(st.session_state.equipment_schedule)
-            st.success(st.session_state.drawing_filename + " (" + str(count) + " items)")
-            with st.expander("View Equipment"):
-                st.dataframe(pd.DataFrame(st.session_state.equipment_schedule), height=250)
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        draw_file = st.file_uploader(
+            "Upload drawing schedule (PDF, Excel, CSV)", 
+            type=['pdf', 'csv', 'xlsx', 'xls'], 
+            key="draw_upload"
+        )
         
-        df_file = st.file_uploader("Upload Drawing", type=['pdf', 'csv', 'xlsx', 'xls'], key="draw")
-        if df_file and df_file.name != st.session_state.drawing_filename:
-            with st.spinner("Processing..."):
-                parsed = parse_uploaded_file(df_file)
-                if parsed:
-                    equip = process_drawing_file(parsed)
-                    if equip:
-                        st.session_state.equipment_schedule = equip
-                        st.session_state.drawing_filename = df_file.name
-                        st.rerun()
-                    else:
-                        st.error("Could not extract equipment")
+        if draw_file:
+            if draw_file.name != st.session_state.drawing_filename:
+                with st.spinner("Processing drawing..."):
+                    parsed = parse_uploaded_file(draw_file)
+                    if parsed:
+                        dfs = get_dataframes_from_parsed(parsed)
+                        if dfs:
+                            # Combine all tables/sheets
+                            combined = pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
+                            combined = combined.dropna(how='all').reset_index(drop=True)
+                            st.session_state.drawing_df = combined
+                            st.session_state.drawing_filename = draw_file.name
+                            st.session_state.column_mapping = auto_detect_columns(combined, 'drawing')
+                            st.session_state.drawing_data = None
+                        else:
+                            st.error("Could not extract data from file")
     
-    with c2:
-        st.subheader("Quotations")
+    with col2:
+        if st.session_state.drawing_filename:
+            st.success(f"✅ {st.session_state.drawing_filename}")
+    
+    # Column mapping for drawing
+    if st.session_state.drawing_df is not None:
+        st.markdown("---")
+        st.subheader("2️⃣ Map Drawing Columns")
+        
+        df = st.session_state.drawing_df
+        col_options = ['-- Not Used --'] + list(df.columns)
+        
+        with st.expander("Preview Drawing Data", expanded=False):
+            st.dataframe(df.head(20), height=250, use_container_width=True)
+        
+        c1, c2, c3 = st.columns(3)
+        
+        with c1:
+            no_idx = col_options.index(st.session_state.column_mapping.get('no', '-- Not Used --')) if st.session_state.column_mapping.get('no') in col_options else 0
+            no_col = st.selectbox("Item No. Column *", col_options, index=no_idx, key="map_no")
+            
+            desc_idx = col_options.index(st.session_state.column_mapping.get('description', '-- Not Used --')) if st.session_state.column_mapping.get('description') in col_options else 0
+            desc_col = st.selectbox("Description Column *", col_options, index=desc_idx, key="map_desc")
+        
+        with c2:
+            qty_idx = col_options.index(st.session_state.column_mapping.get('qty', '-- Not Used --')) if st.session_state.column_mapping.get('qty') in col_options else 0
+            qty_col = st.selectbox("Quantity Column", col_options, index=qty_idx, key="map_qty")
+            
+            equip_idx = col_options.index(st.session_state.column_mapping.get('equip_num', '-- Not Used --')) if st.session_state.column_mapping.get('equip_num') in col_options else 0
+            equip_col = st.selectbox("Equipment/Model # Column", col_options, index=equip_idx, key="map_equip")
+        
+        with c3:
+            st.session_state.use_categories = st.checkbox("Use Category Codes", value=st.session_state.use_categories)
+            
+            if st.session_state.use_categories:
+                cat_idx = col_options.index(st.session_state.column_mapping.get('category', '-- Not Used --')) if st.session_state.column_mapping.get('category') in col_options else 0
+                cat_col = st.selectbox("Category Column", col_options, index=cat_idx, key="map_cat")
+            else:
+                cat_col = '-- Not Used --'
+        
+        # Apply mapping button
+        if st.button("✅ Apply Column Mapping", type="primary"):
+            mapping = {}
+            if no_col != '-- Not Used --':
+                mapping['no'] = no_col
+            if desc_col != '-- Not Used --':
+                mapping['description'] = desc_col
+            if qty_col != '-- Not Used --':
+                mapping['qty'] = qty_col
+            if equip_col != '-- Not Used --':
+                mapping['equip_num'] = equip_col
+            if cat_col != '-- Not Used --':
+                mapping['category'] = cat_col
+            
+            st.session_state.column_mapping = mapping
+            
+            # Extract data
+            items = extract_drawing_data(df, mapping)
+            if items:
+                st.session_state.drawing_data = items
+                st.success(f"✅ Extracted {len(items)} items from drawing")
+                st.rerun()
+            else:
+                st.error("Could not extract data. Check column mapping.")
+    
+    # Show extracted drawing data
+    if st.session_state.drawing_data:
+        with st.expander(f"📋 Extracted Drawing Items ({len(st.session_state.drawing_data)} items)", expanded=False):
+            st.dataframe(pd.DataFrame(st.session_state.drawing_data), height=300, use_container_width=True)
+    
+    st.markdown("---")
+    st.subheader("3️⃣ Upload Quotations")
+    
+    qcol1, qcol2 = st.columns([2, 1])
+    
+    with qcol1:
+        quote_files = st.file_uploader(
+            "Upload quote files (PDF, Excel, CSV)", 
+            type=['pdf', 'csv', 'xlsx', 'xls'], 
+            accept_multiple_files=True,
+            key="quote_upload"
+        )
+        
+        if quote_files:
+            for qf in quote_files:
+                if qf.name not in st.session_state.quotes_data:
+                    with st.spinner(f"Processing {qf.name}..."):
+                        parsed = parse_uploaded_file(qf)
+                        if parsed:
+                            dfs = get_dataframes_from_parsed(parsed)
+                            if dfs:
+                                all_items = []
+                                for qdf in dfs:
+                                    col_map = auto_detect_columns(qdf, 'quote')
+                                    items = extract_quote_data(qdf, col_map, qf.name)
+                                    all_items.extend(items)
+                                
+                                if all_items:
+                                    st.session_state.quotes_data[qf.name] = all_items
+                                    st.success(f"✅ {len(all_items)} items from {qf.name}")
+    
+    with qcol2:
         if st.session_state.quotes_data:
-            st.success(str(len(st.session_state.quotes_data)) + " quote file(s)")
+            st.success(f"📄 {len(st.session_state.quotes_data)} quote file(s)")
             for fn, qs in st.session_state.quotes_data.items():
                 total = sum(q['Total_Price'] for q in qs)
-                st.write(fn + ": " + str(len(qs)) + " items ($" + "{:,.2f}".format(total) + ")")
-        
-        qf = st.file_uploader("Upload Quotes", type=['pdf', 'csv', 'xlsx', 'xls'], key="quote", accept_multiple_files=True)
-        if qf:
-            for f in qf:
-                if f.name not in st.session_state.quotes_data:
-                    with st.spinner("Processing..."):
-                        parsed = parse_uploaded_file(f)
-                        if parsed:
-                            q = process_quote_file(parsed)
-                            if q:
-                                st.session_state.quotes_data[f.name] = q
-                                st.success(str(len(q)) + " items from " + f.name)
-        
-        if st.session_state.quotes_data:
-            if st.button("Clear Quotes"):
+                st.caption(f"• {fn}: {len(qs)} items (${total:,.2f})")
+            
+            if st.button("🗑️ Clear All Quotes"):
                 st.session_state.quotes_data = {}
                 st.rerun()
     
     st.markdown("---")
-    if st.button("Reset All"):
-        st.session_state.equipment_schedule = None
-        st.session_state.quotes_data = {}
-        st.session_state.drawing_filename = None
+    if st.button("🔄 Reset Everything"):
+        for key in ['drawing_data', 'drawing_df', 'quotes_data', 'drawing_filename', 'column_mapping']:
+            if key in st.session_state:
+                st.session_state[key] = None if key != 'quotes_data' else {}
         st.rerun()
 
+# ===== TAB 2: Dashboard =====
 with tabs[1]:
-    if not st.session_state.equipment_schedule:
-        st.warning("Upload drawing first")
+    if not st.session_state.drawing_data:
+        st.warning("⚠️ Please upload and configure drawing first")
     elif not st.session_state.quotes_data:
-        st.warning("Upload quotes first")
+        st.warning("⚠️ Please upload quotations")
     else:
-        all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
-        df = analyze_drawing_vs_quotes(st.session_state.equipment_schedule, all_q)
+        all_quotes = [q for qs in st.session_state.quotes_data.values() for q in qs]
+        df = analyze_data(
+            st.session_state.drawing_data, 
+            all_quotes, 
+            st.session_state.use_categories,
+            st.session_state.supplier_codes
+        )
         
-        st.subheader("Coverage Summary")
-        act = df[~df['Status'].isin(['IH Supply', 'Existing', 'N/A'])]
+        st.subheader("📊 Coverage Summary")
+        
+        # Actionable items (exclude owner supply, existing, N/A)
+        if st.session_state.use_categories:
+            actionable = df[~df['Status'].isin(['Owner Supply', 'Existing', 'N/A'])]
+        else:
+            actionable = df[~df['Status'].isin(['N/A'])]
         
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Quoted", len(act[act['Status'] == 'Quoted']))
-        c2.metric("Missing", len(act[act['Status'] == 'MISSING']))
-        c3.metric("Qty Mismatch", len(act[act['Status'] == 'Qty Mismatch']))
-        c4.metric("Needs Install", len(act[act['Status'] == 'Needs Install']))
+        c1.metric("✅ Quoted", len(actionable[actionable['Status'] == 'Quoted']))
+        c2.metric("❌ Missing", len(actionable[actionable['Status'] == 'MISSING']))
+        c3.metric("⚠️ Qty Mismatch", len(actionable[actionable['Status'] == 'Qty Mismatch']))
+        c4.metric("📋 Needs Pricing", len(actionable[actionable['Status'] == 'Needs Pricing']))
         
         col1, col2 = st.columns(2)
-        col1.metric("Total Quoted", "$" + "{:,.2f}".format(df['Total_Price'].sum()))
-        col2.metric("Total Items", str(len(df)) + " (" + str(len(act)) + " actionable)")
+        col1.metric("💰 Total Quoted Value", f"${df['Total_Price'].sum():,.2f}")
+        col2.metric("📦 Total Items", f"{len(df)} ({len(actionable)} actionable)")
         
         ch1, ch2 = st.columns(2)
+        
         with ch1:
             vc = df['Status'].value_counts().reset_index()
             vc.columns = ['Status', 'Count']
-            colors = {'Quoted': '#28a745', 'MISSING': '#dc3545', 'Qty Mismatch': '#ffc107', 
-                      'Needs Install': '#fd7e14', 'IH Supply': '#6c757d', 'Existing': '#adb5bd', 'N/A': '#e9ecef'}
-            fig = px.pie(vc, values='Count', names='Status', color='Status', color_discrete_map=colors)
+            colors = {
+                'Quoted': '#28a745', 'MISSING': '#dc3545', 'Qty Mismatch': '#ffc107',
+                'Needs Pricing': '#fd7e14', 'Owner Supply': '#6c757d', 
+                'Existing': '#adb5bd', 'N/A': '#e9ecef'
+            }
+            fig = px.pie(vc, values='Count', names='Status', color='Status', 
+                        color_discrete_map=colors, title="Status Distribution")
             st.plotly_chart(fig, use_container_width=True)
         
         with ch2:
-            cat_df = df[df['Category'].notna()].groupby('Category').size().reset_index(name='Items')
-            cat_df['Label'] = cat_df['Category'].astype(int).apply(lambda x: "Cat " + str(x))
-            fig2 = px.bar(cat_df, x='Label', y='Items', title="By Category")
-            st.plotly_chart(fig2, use_container_width=True)
+            if st.session_state.use_categories and df['Category'].notna().any():
+                cat_df = df[df['Category'].notna()].groupby('Category').size().reset_index(name='Items')
+                cat_df['Label'] = cat_df['Category'].astype(int).apply(lambda x: f"Cat {x}")
+                fig2 = px.bar(cat_df, x='Label', y='Items', title="Items by Category")
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                # Show status breakdown as bar
+                fig2 = px.bar(vc, x='Status', y='Count', title="Items by Status", color='Status',
+                             color_discrete_map=colors)
+                st.plotly_chart(fig2, use_container_width=True)
 
+# ===== TAB 3: Analysis =====
 with tabs[2]:
-    if st.session_state.equipment_schedule and st.session_state.quotes_data:
-        all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
-        df = analyze_drawing_vs_quotes(st.session_state.equipment_schedule, all_q)
+    if st.session_state.drawing_data and st.session_state.quotes_data:
+        all_quotes = [q for qs in st.session_state.quotes_data.values() for q in qs]
+        df = analyze_data(
+            st.session_state.drawing_data, 
+            all_quotes,
+            st.session_state.use_categories,
+            st.session_state.supplier_codes
+        )
         
-        st.subheader("Full Analysis")
+        st.subheader("🔍 Detailed Analysis")
         
         col1, col2 = st.columns(2)
         status_opts = df['Status'].unique().tolist()
-        filt_status = col1.multiselect("Status", status_opts, default=status_opts)
-        cat_opts = sorted([int(c) for c in df['Category'].dropna().unique()])
-        filt_cat = col2.multiselect("Category", cat_opts, default=cat_opts)
+        filt_status = col1.multiselect("Filter by Status", status_opts, default=status_opts)
         
+        if st.session_state.use_categories and df['Category'].notna().any():
+            cat_opts = sorted([int(c) for c in df['Category'].dropna().unique()])
+            filt_cat = col2.multiselect("Filter by Category", cat_opts, default=cat_opts)
+        else:
+            filt_cat = None
+        
+        # Filter data
         fdf = df[df['Status'].isin(filt_status)]
         if filt_cat:
             fdf = fdf[(fdf['Category'].isin(filt_cat)) | (fdf['Category'].isna())]
         
-        def highlight(row):
+        # Highlight function
+        def highlight_row(row):
             colors = {
-                'Quoted': 'background-color:#d4edda', 
-                'MISSING': 'background-color:#f8d7da', 
-                'Qty Mismatch': 'background-color:#fff3cd', 
-                'Needs Install': 'background-color:#ffe5d0'
+                'Quoted': 'background-color:#d4edda',
+                'MISSING': 'background-color:#f8d7da',
+                'Qty Mismatch': 'background-color:#fff3cd',
+                'Needs Pricing': 'background-color:#ffe5d0'
             }
             return [colors.get(row['Status'], '')] * len(row)
         
-        cols = ['Drawing_No', 'New_Equip_Num', 'Description', 'Drawing_Qty', 'Category', 
-                'Quote_Item_No', 'Quote_Qty', 'Unit_Price', 'Total_Price', 'Status', 'Issue']
-        st.dataframe(fdf[cols].style.apply(highlight, axis=1), height=450, use_container_width=True)
+        # Select columns to display
+        display_cols = ['Drawing_No', 'Equip_Num', 'Description', 'Drawing_Qty']
+        if st.session_state.use_categories:
+            display_cols.append('Category')
+        display_cols.extend(['Quote_Item_No', 'Quote_Qty', 'Unit_Price', 'Total_Price', 'Status', 'Issue'])
         
-        st.subheader("Critical Missing (Cat 5 & 6)")
-        crit = df[(df['Status'] == 'MISSING') & (df['Category'].isin([5, 6]))]
-        if len(crit) > 0:
-            st.error(str(len(crit)) + " items need quotes!")
-            st.dataframe(crit[['Drawing_No', 'New_Equip_Num', 'Description', 'Drawing_Qty', 'Category_Desc']])
+        st.dataframe(
+            fdf[display_cols].style.apply(highlight_row, axis=1),
+            height=450, 
+            use_container_width=True
+        )
+        
+        # Critical missing section
+        st.subheader("🚨 Critical Missing Items")
+        if st.session_state.use_categories:
+            critical = df[(df['Status'] == 'MISSING') & (df['Category'].isin([5, 6]))]
         else:
-            st.success("No critical missing!")
+            critical = df[df['Status'] == 'MISSING']
+        
+        if len(critical) > 0:
+            st.error(f"⚠️ {len(critical)} items require quotes!")
+            st.dataframe(critical[['Drawing_No', 'Equip_Num', 'Description', 'Drawing_Qty']], use_container_width=True)
+        else:
+            st.success("✅ No critical missing items!")
 
+# ===== TAB 4: Summary =====
 with tabs[3]:
-    if st.session_state.equipment_schedule and st.session_state.quotes_data:
-        all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
-        df = analyze_drawing_vs_quotes(st.session_state.equipment_schedule, all_q)
+    if st.session_state.drawing_data and st.session_state.quotes_data:
+        all_quotes = [q for qs in st.session_state.quotes_data.values() for q in qs]
+        df = analyze_data(
+            st.session_state.drawing_data, 
+            all_quotes,
+            st.session_state.use_categories,
+            st.session_state.supplier_codes
+        )
         
-        st.subheader("By Category")
-        summary = []
-        for code, desc in SUPPLIER_CODES.items():
-            ci = df[df['Category'] == code]
-            if len(ci) > 0:
-                summary.append({
-                    'Cat': code, 
-                    'Description': desc, 
-                    'Items': len(ci),
-                    'Quoted': len(ci[ci['Status'] == 'Quoted']), 
-                    'Missing': len(ci[ci['Status'] == 'MISSING']),
-                    'Value': "$" + "{:,.2f}".format(ci['Total_Price'].sum())
-                })
-        st.dataframe(pd.DataFrame(summary), use_container_width=True)
+        if st.session_state.use_categories and df['Category'].notna().any():
+            st.subheader("📋 Summary by Category")
+            summary = []
+            for code, desc in st.session_state.supplier_codes.items():
+                ci = df[df['Category'] == code]
+                if len(ci) > 0:
+                    summary.append({
+                        'Category': code,
+                        'Description': desc,
+                        'Items': len(ci),
+                        'Quoted': len(ci[ci['Status'] == 'Quoted']),
+                        'Missing': len(ci[ci['Status'] == 'MISSING']),
+                        'Value': f"${ci['Total_Price'].sum():,.2f}"
+                    })
+            if summary:
+                st.dataframe(pd.DataFrame(summary), use_container_width=True)
         
+        st.subheader("📋 Summary by Status")
+        status_summary = df.groupby('Status').agg(
+            Items=('Status', 'count'),
+            Total_Value=('Total_Price', 'sum')
+        ).reset_index()
+        status_summary['Total_Value'] = status_summary['Total_Value'].apply(lambda x: f"${x:,.2f}")
+        st.dataframe(status_summary, use_container_width=True)
+        
+        # Quote file summary
+        st.subheader("📄 Quote Files Summary")
+        quote_summary = []
+        for fn, qs in st.session_state.quotes_data.items():
+            quote_summary.append({
+                'File': fn,
+                'Items': len(qs),
+                'Total Value': f"${sum(q['Total_Price'] for q in qs):,.2f}"
+            })
+        st.dataframe(pd.DataFrame(quote_summary), use_container_width=True)
+        
+        # Items without category
         no_cat = df[df['Category'].isna()]
         if len(no_cat) > 0:
-            st.subheader("SPARE Items")
-            st.dataframe(no_cat[['Drawing_No', 'New_Equip_Num', 'Description', 'Drawing_Qty']])
+            st.subheader("📌 Items Without Category / SPARE")
+            st.dataframe(no_cat[['Drawing_No', 'Equip_Num', 'Description', 'Drawing_Qty', 'Status']], use_container_width=True)
 
+# ===== TAB 5: Export =====
 with tabs[4]:
-    st.subheader("Export")
+    st.subheader("💾 Export Data")
     
-    if st.session_state.equipment_schedule:
-        eq_df = pd.DataFrame(st.session_state.equipment_schedule)
-        out_eq = io.BytesIO()
-        eq_df.to_excel(out_eq, index=False)
-        out_eq.seek(0)
-        fname = "Drawing_" + datetime.now().strftime('%Y%m%d') + ".xlsx"
-        st.download_button("Download Drawing", out_eq, fname)
+    col1, col2 = st.columns(2)
     
-    if st.session_state.equipment_schedule and st.session_state.quotes_data:
-        all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
-        df = analyze_drawing_vs_quotes(st.session_state.equipment_schedule, all_q)
+    with col1:
+        if st.session_state.drawing_data:
+            st.markdown("**Drawing Data**")
+            eq_df = pd.DataFrame(st.session_state.drawing_data)
+            out_eq = io.BytesIO()
+            eq_df.to_excel(out_eq, index=False)
+            out_eq.seek(0)
+            st.download_button(
+                "📥 Download Drawing Data",
+                out_eq,
+                f"Drawing_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+    
+    with col2:
+        if st.session_state.quotes_data:
+            st.markdown("**Quote Data**")
+            all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
+            q_df = pd.DataFrame(all_q)
+            out_q = io.BytesIO()
+            q_df.to_excel(out_q, index=False)
+            out_q.seek(0)
+            st.download_button(
+                "📥 Download Quote Data",
+                out_q,
+                f"Quotes_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+    
+    st.markdown("---")
+    
+    if st.session_state.drawing_data and st.session_state.quotes_data:
+        st.markdown("**Full Analysis Report**")
+        
+        all_quotes = [q for qs in st.session_state.quotes_data.values() for q in qs]
+        df = analyze_data(
+            st.session_state.drawing_data, 
+            all_quotes,
+            st.session_state.use_categories,
+            st.session_state.supplier_codes
+        )
         
         out = io.BytesIO()
-        with pd.ExcelWriter(out, engine='openpyxl') as w:
-            df.to_excel(w, sheet_name='Analysis', index=False)
-            df[df['Status'] == 'MISSING'].to_excel(w, sheet_name='Missing', index=False)
-            df[(df['Status'] == 'MISSING') & (df['Category'].isin([5, 6]))].to_excel(w, sheet_name='Critical', index=False)
-            pd.DataFrame(all_q).to_excel(w, sheet_name='Quotes', index=False)
+        with pd.ExcelWriter(out, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Full Analysis', index=False)
+            df[df['Status'] == 'MISSING'].to_excel(writer, sheet_name='Missing Items', index=False)
+            df[df['Status'] == 'Quoted'].to_excel(writer, sheet_name='Quoted Items', index=False)
+            df[df['Status'] == 'Qty Mismatch'].to_excel(writer, sheet_name='Qty Mismatch', index=False)
+            pd.DataFrame(all_quotes).to_excel(writer, sheet_name='All Quotes', index=False)
         out.seek(0)
-        fname = "Analysis_" + datetime.now().strftime('%Y%m%d') + ".xlsx"
-        st.download_button("Download Analysis", out, fname)
+        
+        st.download_button(
+            "📥 Download Full Analysis Report",
+            out,
+            f"Analysis_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
 
 st.markdown("---")
-st.write("Drawing Quote Analyzer v6.5")
+st.caption("Universal Drawing Quote Analyzer v7.0")
