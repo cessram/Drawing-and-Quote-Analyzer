@@ -63,8 +63,139 @@ def clean_dataframe_columns(df):
     df = df.dropna(how='all')
     return df
 
+def extract_text_based_quote(uploaded_file):
+    """Extract quote data from PDF using text extraction for complex formats."""
+    if not PDF_SUPPORT:
+        return None
+    
+    uploaded_file.seek(0)
+    items = []
+    
+    try:
+        with pdfplumber.open(uploaded_file) as pdf:
+            full_text = ""
+            for page in pdf.pages:
+                full_text += page.extract_text() or ""
+                full_text += "\n"
+        
+        # Pattern to match item lines: Item number, optional qty, description, prices
+        # Handles formats like: "2 1 ea WALK IN $97,980.27 $97,980.27"
+        # Or: "1 NIC"
+        # Or: "11-23 NIC"
+        
+        lines = full_text.split('\n')
+        current_item = None
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Skip header lines
+            if line.startswith('Item') and 'Qty' in line and 'Description' in line:
+                continue
+            if 'Canadian Restaurant Supply' in line or 'Bird Construc' in line:
+                continue
+            if 'Page ' in line and ' of ' in line:
+                continue
+            
+            # Match item patterns
+            # Pattern 1: "NUMBER NIC" (NIC items)
+            nic_match = re.match(r'^(\d+(?:-\d+)?)\s+NIC\s*$', line, re.IGNORECASE)
+            if nic_match:
+                item_no = nic_match.group(1)
+                items.append({
+                    'Item': item_no,
+                    'Qty': '',
+                    'Description': 'NIC',
+                    'Sell': '',
+                    'Sell Total': ''
+                })
+                continue
+            
+            # Pattern 2: "NUMBER QTY DESCRIPTION PRICE PRICE"
+            # e.g., "2 1 ea WALK IN $97,980.27 $97,980.27"
+            item_match = re.match(
+                r'^(\d+)\s+(\d+\s*ea)?\s*([A-Z][A-Z\s,/\-&\(\)]+?)?\s*\$?([\d,]+\.?\d*)\s*\$?([\d,]+\.?\d*)\s*$',
+                line, re.IGNORECASE
+            )
+            if item_match:
+                item_no = item_match.group(1)
+                qty = item_match.group(2) or ''
+                desc = item_match.group(3) or ''
+                sell = item_match.group(4) or ''
+                sell_total = item_match.group(5) or ''
+                
+                items.append({
+                    'Item': item_no,
+                    'Qty': qty.strip(),
+                    'Description': desc.strip(),
+                    'Sell': sell,
+                    'Sell Total': sell_total
+                })
+                continue
+        
+        if items:
+            return pd.DataFrame(items)
+    except Exception as e:
+        st.warning(f"Text extraction failed: {e}")
+    
+    return None
+
+def parse_pdf_tables_for_quote(uploaded_file):
+    """Extract tables from PDF with improved handling for quote format."""
+    if not PDF_SUPPORT:
+        return None
+    
+    uploaded_file.seek(0)
+    all_rows = []
+    
+    try:
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                tables = page.extract_tables()
+                
+                for table in tables:
+                    if not table or len(table) < 1:
+                        continue
+                    
+                    # Find header row
+                    header_idx = -1
+                    for i, row in enumerate(table):
+                        row_text = ' '.join([str(c).lower() if c else '' for c in row])
+                        if 'item' in row_text and ('qty' in row_text or 'description' in row_text):
+                            header_idx = i
+                            break
+                    
+                    if header_idx >= 0:
+                        headers = table[header_idx]
+                        headers = [str(h).strip() if h else f'Col_{i}' for i, h in enumerate(headers)]
+                        
+                        for row in table[header_idx + 1:]:
+                            if row and any(cell for cell in row if cell):
+                                all_rows.append(dict(zip(headers, row)))
+                    else:
+                        # No header found, use generic column names
+                        if table:
+                            max_cols = max(len(row) for row in table if row)
+                            headers = [f'Column_{i}' for i in range(max_cols)]
+                            for row in table:
+                                if row and any(cell for cell in row if cell):
+                                    padded_row = list(row) + [''] * (max_cols - len(row))
+                                    all_rows.append(dict(zip(headers, padded_row)))
+        
+        if all_rows:
+            df = pd.DataFrame(all_rows)
+            df = clean_dataframe_columns(df)
+            return [df]
+    
+    except Exception as e:
+        st.warning(f"PDF table extraction error: {e}")
+    
+    return None
+
 def parse_pdf_tables(uploaded_file):
-    """Extract tables from PDF."""
+    """Extract tables from PDF - original for drawings."""
     if not PDF_SUPPORT:
         return None
     uploaded_file.seek(0)
@@ -112,11 +243,13 @@ def parse_csv_file(uploaded_file):
         st.warning(f"Could not read CSV file: {e}")
         return None
 
-def parse_uploaded_file(uploaded_file):
+def parse_uploaded_file(uploaded_file, file_type='drawing'):
     """Parse any supported file type and return list of DataFrames."""
     ext = uploaded_file.name.split('.')[-1].lower()
     
     if ext == 'pdf':
+        if file_type == 'quote':
+            return parse_pdf_tables_for_quote(uploaded_file)
         return parse_pdf_tables(uploaded_file)
     elif ext in ['xlsx', 'xls']:
         return parse_excel_file(uploaded_file)
@@ -179,6 +312,8 @@ def parse_qty_value(val):
     if pd.isna(val):
         return 1
     val_str = str(val).strip().lower()
+    if not val_str or val_str in ('nan', 'none', ''):
+        return 1
     # Handle "X ea" format
     match = re.search(r'(\d+)\s*ea', val_str)
     if match:
@@ -246,8 +381,15 @@ def extract_drawing_data(df, col_map):
     
     return items if items else None
 
+def is_nic_value(val):
+    """Check if a value indicates NIC (Not In Contract)."""
+    if pd.isna(val):
+        return False
+    val_str = str(val).strip().upper()
+    return val_str == 'NIC' or val_str.startswith('NIC')
+
 def extract_quote_data(df, col_map, source_file):
-    """Extract quote data using column mapping with NIC handling."""
+    """Extract quote data using column mapping with improved NIC handling."""
     items = []
     
     no_col = col_map.get('no')
@@ -260,46 +402,63 @@ def extract_quote_data(df, col_map, source_file):
         try:
             # Get item number
             no_val = ''
-            if no_col:
+            if no_col and no_col in row.index:
                 no_val = str(row.get(no_col, '')).strip()
-                if no_val.lower() in ('nan', 'none'):
+                if no_val.lower() in ('nan', 'none', 'item'):
                     no_val = ''
             
             # Get description
             desc_val = ''
-            if desc_col:
+            if desc_col and desc_col in row.index:
                 desc_val = str(row.get(desc_col, '')).strip()
-                if desc_val.lower() in ('nan', 'none'):
+                if desc_val.lower() in ('nan', 'none', 'description'):
                     desc_val = ''
             
-            # Skip if both are empty or look like headers
-            if not no_val and not desc_val:
-                continue
-            if no_val.lower() in ('item', 'no', 'no.', '#', 'line'):
-                continue
-            if desc_val.lower() in ('description', 'item description'):
+            # Get qty value for NIC check
+            qty_raw = ''
+            if qty_col and qty_col in row.index:
+                qty_raw = str(row.get(qty_col, '')).strip()
+            
+            # Skip if no item number and no meaningful data
+            if not no_val:
+                # Check if this row might have item number in first available column
+                for col in df.columns:
+                    cell_val = str(row.get(col, '')).strip()
+                    if re.match(r'^\d+(-\d+)?$', cell_val):
+                        no_val = cell_val
+                        break
+            
+            if not no_val:
                 continue
             
-            # Check for NIC (Not In Contract)
-            is_nic = desc_val.upper().strip() == 'NIC' or 'NIC' in desc_val.upper()
+            # Skip header-like rows
+            if no_val.lower() in ('item', 'no', 'no.', '#', 'line', 'seq'):
+                continue
+            
+            # Check for NIC in description or qty column
+            is_nic = False
+            if is_nic_value(desc_val):
+                is_nic = True
+                desc_val = 'NIC'
+            elif is_nic_value(qty_raw):
+                is_nic = True
+                desc_val = 'NIC' if not desc_val else desc_val
             
             # Get quantity
             qty = 1
-            if qty_col:
-                qty_raw = row.get(qty_col, '')
-                if pd.notna(qty_raw) and str(qty_raw).strip():
-                    qty = parse_qty_value(qty_raw)
+            if qty_col and qty_col in row.index and not is_nic:
+                qty = parse_qty_value(row.get(qty_col, ''))
             
             # Get unit price
-            unit_price = 0
-            if unit_col:
+            unit_price = 0.0
+            if unit_col and unit_col in row.index:
                 up = clean_numeric(row.get(unit_col, 0))
                 if up:
                     unit_price = up
             
             # Get total price
-            total_price = 0
-            if total_col:
+            total_price = 0.0
+            if total_col and total_col in row.index:
                 tp = clean_numeric(row.get(total_col, 0))
                 if tp:
                     total_price = tp
@@ -312,15 +471,32 @@ def extract_quote_data(df, col_map, source_file):
             if unit_price == 0 and total_price > 0 and qty > 0:
                 unit_price = total_price / qty
             
-            items.append({
-                'Item_No': no_val,
-                'Description': desc_val,
-                'Qty': qty,
-                'Unit_Price': unit_price,
-                'Total_Price': total_price,
-                'Is_NIC': is_nic,
-                'Source_File': source_file
-            })
+            # Handle item ranges like "11-23" - expand to individual items
+            range_match = re.match(r'^(\d+)-(\d+)$', no_val)
+            if range_match:
+                start = int(range_match.group(1))
+                end = int(range_match.group(2))
+                for item_num in range(start, end + 1):
+                    items.append({
+                        'Item_No': str(item_num),
+                        'Description': desc_val if desc_val else 'NIC',
+                        'Qty': qty,
+                        'Unit_Price': unit_price,
+                        'Total_Price': total_price / (end - start + 1) if total_price > 0 else 0,
+                        'Is_NIC': is_nic or is_nic_value(desc_val),
+                        'Source_File': source_file
+                    })
+            else:
+                items.append({
+                    'Item_No': no_val,
+                    'Description': desc_val if desc_val else '-',
+                    'Qty': qty,
+                    'Unit_Price': unit_price,
+                    'Total_Price': total_price,
+                    'Is_NIC': is_nic or is_nic_value(desc_val),
+                    'Source_File': source_file
+                })
+                
         except Exception as e:
             continue
     
@@ -435,7 +611,7 @@ with tabs[0]:
         if draw_file:
             if draw_file.name != st.session_state.drawing_filename:
                 with st.spinner("Processing drawing..."):
-                    dfs = parse_uploaded_file(draw_file)
+                    dfs = parse_uploaded_file(draw_file, 'drawing')
                     if dfs and len(dfs) > 0:
                         combined = max(dfs, key=len)
                         combined = combined.reset_index(drop=True)
@@ -532,12 +708,13 @@ with tabs[0]:
             for qf in quote_files:
                 if qf.name not in st.session_state.quote_dfs:
                     with st.spinner(f"Processing {qf.name}..."):
-                        dfs = parse_uploaded_file(qf)
+                        dfs = parse_uploaded_file(qf, 'quote')
                         if dfs and len(dfs) > 0:
                             combined_df = pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
                             combined_df = combined_df.reset_index(drop=True)
                             st.session_state.quote_dfs[qf.name] = combined_df
                             st.session_state.quote_mappings[qf.name] = auto_detect_columns(combined_df, 'quote')
+                            st.success(f"✅ Loaded {qf.name}")
                             st.rerun()
                         else:
                             st.error(f"❌ Could not extract data from {qf.name}")
@@ -586,16 +763,17 @@ with tabs[0]:
         
         for filename, qdf in st.session_state.quote_dfs.items():
             with st.expander(f"📄 {filename} ({len(qdf)} rows)", expanded=(filename not in st.session_state.quotes_data)):
-                st.dataframe(qdf.head(15), height=180, use_container_width=True)
+                st.dataframe(qdf.head(20), height=200, use_container_width=True)
                 
                 q_col_options = ['-- Not Used --'] + list(qdf.columns)
                 current_map = st.session_state.quote_mappings.get(filename, {})
                 
+                st.markdown("**Select columns for analysis:**")
                 qc1, qc2 = st.columns(2)
                 
                 with qc1:
                     q_no_idx = q_col_options.index(current_map.get('no')) if current_map.get('no') in q_col_options else 0
-                    q_no_col = st.selectbox("Item No.", q_col_options, index=q_no_idx, key=f"q_no_{filename}")
+                    q_no_col = st.selectbox("Item No. *", q_col_options, index=q_no_idx, key=f"q_no_{filename}")
                     
                     q_desc_idx = q_col_options.index(current_map.get('description')) if current_map.get('description') in q_col_options else 0
                     q_desc_col = st.selectbox("Description", q_col_options, index=q_desc_idx, key=f"q_desc_{filename}")
@@ -652,6 +830,9 @@ with tabs[0]:
                     nic_count = sum(1 for i in items if i.get('Is_NIC'))
                     total = sum(i['Total_Price'] for i in items if not i.get('Is_NIC'))
                     st.success(f"✅ {len(items)} items | {nic_count} NIC | Total: ${total:,.2f}")
+                    
+                    with st.expander("View Extracted Quote Items"):
+                        st.dataframe(pd.DataFrame(items), height=200, use_container_width=True)
     
     # Summary
     if st.session_state.quotes_data:
@@ -869,4 +1050,4 @@ with tabs[4]:
         st.warning("⚠️ Please upload and configure both drawing and quotations first")
 
 st.markdown("---")
-st.caption("Universal Drawing Quote Analyzer v10.0 | NIC = Not In Contract")
+st.caption("Universal Drawing Quote Analyzer v11.0 | NIC = Not In Contract")
