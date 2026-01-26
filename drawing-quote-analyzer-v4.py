@@ -14,50 +14,59 @@ except ImportError:
 st.set_page_config(page_title="Drawing Quote Analyzer", page_icon="📊", layout="wide")
 
 DEFAULT_SUPPLIER_CODES = {
-    1: "Owner Supply / Owner Install", 2: "Owner Supply / Owner Install (Special)",
-    3: "Owner Supply / Owner Install (Other)", 4: "Owner Supply / Vendor Install",
-    5: "Contractor Supply / Contractor Install", 6: "Contractor Supply / Vendor Install",
-    7: "Owner Supply / Contractor Install", 8: "Existing / Relocated"
+    1: "Owner Supply / Owner Install",
+    2: "Owner Supply / Owner Install (Special)",
+    3: "Owner Supply / Owner Install (Other)",
+    4: "Owner Supply / Vendor Install",
+    5: "Contractor Supply / Contractor Install",
+    6: "Contractor Supply / Vendor Install",
+    7: "Owner Supply / Contractor Install",
+    8: "Existing / Relocated"
 }
 
-for key, default in [('drawing_data', None), ('drawing_df', None), ('quotes_data', {}),
-    ('quote_dfs', {}), ('quote_mappings', {}), ('drawing_filename', None),
-    ('column_mapping', {}), ('supplier_codes', DEFAULT_SUPPLIER_CODES.copy()), ('use_categories', True)]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+# Initialize session state
+if 'drawing_data' not in st.session_state:
+    st.session_state.drawing_data = None
+if 'drawing_df' not in st.session_state:
+    st.session_state.drawing_df = None
+if 'quotes_data' not in st.session_state:
+    st.session_state.quotes_data = {}
+if 'quote_dfs' not in st.session_state:
+    st.session_state.quote_dfs = {}
+if 'quote_mappings' not in st.session_state:
+    st.session_state.quote_mappings = {}
+if 'drawing_filename' not in st.session_state:
+    st.session_state.drawing_filename = None
+if 'column_mapping' not in st.session_state:
+    st.session_state.column_mapping = {}
+if 'supplier_codes' not in st.session_state:
+    st.session_state.supplier_codes = DEFAULT_SUPPLIER_CODES.copy()
+if 'use_categories' not in st.session_state:
+    st.session_state.use_categories = True
 
-def clean_df_columns(df):
+def clean_dataframe_columns(df):
+    """Clean DataFrame column names to ensure uniqueness."""
     df = df.copy()
     new_cols = []
     seen = {}
+    
     for i, c in enumerate(df.columns):
-        col = str(c).strip() if pd.notna(c) and str(c).strip() else f'Col_{i}'
-        if col in seen:
-            seen[col] += 1
-            col = f"{col}_{seen[col]}"
+        col_name = str(c).strip() if pd.notna(c) and str(c).strip() != '' else f'Column_{i}'
+        if col_name in seen:
+            seen[col_name] += 1
+            col_name = f"{col_name}_{seen[col_name]}"
         else:
-            seen[col] = 0
-        new_cols.append(col)
+            seen[col_name] = 0
+        new_cols.append(col_name)
+    
     df.columns = new_cols
-    return df.dropna(how='all')
+    df = df.dropna(how='all')
+    return df
 
-def parse_qty(val):
-    if pd.isna(val): return 1
-    val_str = str(val).strip().lower()
-    match = re.search(r'(\d+)\s*ea', val_str)
-    if match: return int(match.group(1))
-    match = re.search(r'^(\d+)', val_str)
-    if match: return int(match.group(1))
-    return 1
-
-def clean_price(val):
-    if pd.isna(val): return 0.0
-    val_str = re.sub(r'[,$\s]', '', str(val).strip())
-    try: return float(val_str) if val_str and val_str.replace('.','').replace('-','').isdigit() else 0.0
-    except: return 0.0
-
-def extract_pdf_method1(uploaded_file):
-    """Method 1: Standard table extraction"""
+def parse_pdf_tables(uploaded_file):
+    """Extract tables from PDF."""
+    if not PDF_SUPPORT:
+        return None
     uploaded_file.seek(0)
     all_tables = []
     try:
@@ -68,507 +77,796 @@ def extract_pdf_method1(uploaded_file):
                     if table and len(table) > 1:
                         headers = [str(h).strip() if h else f'Col_{i}' for i, h in enumerate(table[0])]
                         df = pd.DataFrame(table[1:], columns=headers)
+                        df = clean_dataframe_columns(df)
                         if len(df) > 0:
                             all_tables.append(df)
-        if all_tables:
-            return pd.concat(all_tables, ignore_index=True)
     except Exception as e:
-        st.warning(f"Method 1 failed: {e}")
-    return None
+        st.warning(f"Could not extract tables from PDF: {e}")
+        return None
+    return all_tables if all_tables else None
 
-def extract_pdf_method2(uploaded_file):
-    """Method 2: Extract tables with different settings"""
-    uploaded_file.seek(0)
-    all_rows = []
-    try:
-        with pdfplumber.open(uploaded_file) as pdf:
-            for page in pdf.pages:
-                tables = page.extract_tables(table_settings={
-                    "vertical_strategy": "text",
-                    "horizontal_strategy": "text",
-                    "snap_tolerance": 5,
-                })
-                for table in tables:
-                    if table:
-                        for row in table:
-                            if row and any(c and str(c).strip() for c in row if c):
-                                all_rows.append([str(c).strip() if c else '' for c in row])
-        if all_rows and len(all_rows) > 1:
-            # Find most common length
-            from collections import Counter
-            lengths = [len(r) for r in all_rows]
-            common_len = Counter(lengths).most_common(1)[0][0]
-            normalized = [r for r in all_rows if len(r) == common_len]
-            if normalized:
-                df = pd.DataFrame(normalized[1:], columns=normalized[0])
-                return df
-    except Exception as e:
-        st.warning(f"Method 2 failed: {e}")
-    return None
-
-def extract_pdf_method3(uploaded_file):
-    """Method 3: Text-based extraction for quote format"""
-    uploaded_file.seek(0)
-    items = []
-    try:
-        with pdfplumber.open(uploaded_file) as pdf:
-            full_text = ""
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    full_text += text + "\n"
-            
-            # Parse line by line looking for item patterns
-            lines = full_text.split('\n')
-            current_item = None
-            
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                # Pattern: starts with number, has qty like "1 ea" or "2 ea", has price
-                # Example: "2 1 ea WALK IN $97,980.27 $97,980.27"
-                # Or: "1 NIC"
-                # Or: "10 2 ea STAINLESS $2,206.08 $4,412.16"
-                
-                # Check for NIC pattern: "1 NIC" or "11-23 NIC"
-                nic_match = re.match(r'^(\d+(?:-\d+)?)\s+NIC\s*$', line, re.IGNORECASE)
-                if nic_match:
-                    items.append({
-                        'Item': nic_match.group(1),
-                        'Qty': '',
-                        'Description': 'NIC',
-                        'Sell': '',
-                        'Sell Total': ''
-                    })
-                    continue
-                
-                # Check for item with pricing pattern
-                # Pattern: Item# Qty Description Price Price
-                item_match = re.match(r'^(\d+)\s+(\d+\s*ea)\s+(.+?)\s+\$?([\d,]+\.?\d*)\s+\$?([\d,]+\.?\d*)\s*$', line, re.IGNORECASE)
-                if item_match:
-                    items.append({
-                        'Item': item_match.group(1),
-                        'Qty': item_match.group(2),
-                        'Description': item_match.group(3).strip(),
-                        'Sell': item_match.group(4),
-                        'Sell Total': item_match.group(5)
-                    })
-                    continue
-                
-                # Check for item without pricing (description continues)
-                item_match2 = re.match(r'^(\d+)\s+(\d+\s*ea)\s+(.+)$', line, re.IGNORECASE)
-                if item_match2 and not re.search(r'\$', line):
-                    items.append({
-                        'Item': item_match2.group(1),
-                        'Qty': item_match2.group(2),
-                        'Description': item_match2.group(3).strip(),
-                        'Sell': '',
-                        'Sell Total': ''
-                    })
-            
-            if items:
-                return pd.DataFrame(items)
-    except Exception as e:
-        st.warning(f"Method 3 failed: {e}")
-    return None
-
-def extract_pdf_all_text(uploaded_file):
-    """Extract all text for debugging"""
-    uploaded_file.seek(0)
-    try:
-        with pdfplumber.open(uploaded_file) as pdf:
-            text = ""
-            for i, page in enumerate(pdf.pages[:3]):  # First 3 pages
-                t = page.extract_text()
-                if t:
-                    text += f"=== PAGE {i+1} ===\n{t}\n\n"
-            return text
-    except Exception as e:
-        return f"Error: {e}"
-
-def parse_excel(uploaded_file):
+def parse_excel_file(uploaded_file):
+    """Parse Excel file to list of DataFrames."""
     try:
         uploaded_file.seek(0)
         xl = pd.ExcelFile(uploaded_file)
-        dfs = [clean_df_columns(pd.read_excel(xl, sheet_name=s)) for s in xl.sheet_names]
-        return [d for d in dfs if len(d) > 0] or None
+        dfs = []
+        for name in xl.sheet_names:
+            df = pd.read_excel(xl, sheet_name=name)
+            df = clean_dataframe_columns(df)
+            if len(df) > 0:
+                dfs.append(df)
+        return dfs
     except Exception as e:
-        st.warning(f"Excel error: {e}")
+        st.warning(f"Could not read Excel file: {e}")
         return None
 
-def parse_csv(uploaded_file):
+def parse_csv_file(uploaded_file):
+    """Parse CSV file to DataFrame."""
     try:
         uploaded_file.seek(0)
-        df = clean_df_columns(pd.read_csv(uploaded_file))
+        df = pd.read_csv(uploaded_file)
+        df = clean_dataframe_columns(df)
         return [df] if len(df) > 0 else None
     except Exception as e:
-        st.warning(f"CSV error: {e}")
+        st.warning(f"Could not read CSV file: {e}")
         return None
 
-def parse_file(uploaded_file):
+def parse_uploaded_file(uploaded_file):
+    """Parse any supported file type and return list of DataFrames."""
     ext = uploaded_file.name.split('.')[-1].lower()
+    
     if ext == 'pdf':
-        # Try multiple methods
-        df = extract_pdf_method1(uploaded_file)
-        if df is not None and len(df) > 0:
-            return [clean_df_columns(df)]
-        
-        df = extract_pdf_method2(uploaded_file)
-        if df is not None and len(df) > 0:
-            return [clean_df_columns(df)]
-        
-        df = extract_pdf_method3(uploaded_file)
-        if df is not None and len(df) > 0:
-            return [clean_df_columns(df)]
-        
-        return None
+        return parse_pdf_tables(uploaded_file)
     elif ext in ['xlsx', 'xls']:
-        return parse_excel(uploaded_file)
+        return parse_excel_file(uploaded_file)
     elif ext == 'csv':
-        return parse_csv(uploaded_file)
+        return parse_csv_file(uploaded_file)
     return None
 
-def auto_detect_cols(df, file_type='drawing'):
+def auto_detect_columns(df, file_type='drawing'):
+    """Auto-detect column mappings based on common naming patterns."""
     cols_lower = {c: c.lower().strip() for c in df.columns}
-    patterns = {
-        'drawing': {'no': ['no', 'item', '#'], 'description': ['description', 'desc', 'equipment'], 
-                   'qty': ['qty', 'quantity'], 'category': ['category', 'cat', 'code'], 'equip_num': ['equip', 'model']},
-        'quote': {'no': ['item', 'no', '#'], 'description': ['description', 'desc'], 
-                 'qty': ['qty', 'quantity'], 'unit_price': ['sell', 'price', 'unit'], 'total_price': ['total', 'sell total', 'ext']}
-    }[file_type]
+    
+    if file_type == 'drawing':
+        patterns = {
+            'no': ['no', 'no.', 'item', 'item #', 'item no', 'number', '#', 'id', 'ref'],
+            'description': ['description', 'desc', 'equipment', 'name', 'item description', 'material'],
+            'qty': ['qty', 'qty.', 'quantity', 'count', 'amount', 'units'],
+            'category': ['category', 'cat', 'supplier code', 'code', 'type', 'supply'],
+            'equip_num': ['equipment number', 'equip num', 'equip no', 'equip #', 'model', 'part no', 'part #', 'new equipment'],
+            'unit': ['unit', 'uom', 'measure'],
+            'remarks': ['remarks', 'notes', 'comment', 'comments']
+        }
+    else:  # quote
+        patterns = {
+            'no': ['item', 'no', 'no.', 'item #', 'item no', 'number', '#', 'id', 'ref', 'line', 'seq'],
+            'description': ['description', 'desc', 'equipment', 'name', 'item description', 'material', 'product', 'model'],
+            'qty': ['qty', 'qty.', 'quantity', 'count', 'amount', 'units', 'ea'],
+            'unit_price': ['sell', 'unit price', 'price', 'rate', 'unit cost', 'cost ea', 'each', 'unit'],
+            'total_price': ['sell total', 'total', 'total price', 'ext price', 'extended', 'amount', 'line total', 'ext'],
+        }
     
     found = {}
     for key, opts in patterns.items():
         for col, col_low in cols_lower.items():
-            if any(o in col_low for o in opts):
+            if col_low in opts:
                 found[key] = col
                 break
+            for opt in opts:
+                if opt in col_low:
+                    found[key] = col
+                    break
+            if key in found:
+                break
+    
     return found
 
+def clean_numeric(val):
+    """Clean numeric value from string."""
+    if pd.isna(val):
+        return None
+    val_str = str(val).strip()
+    val_str = re.sub(r'[,$]', '', val_str)
+    val_str = re.sub(r'[^\d.\-]', '', val_str)
+    try:
+        return float(val_str) if val_str else None
+    except:
+        return None
+
+def parse_qty_value(val):
+    """Parse quantity from formats like '1 ea', '2 ea', '1', etc."""
+    if pd.isna(val):
+        return 1
+    val_str = str(val).strip().lower()
+    # Handle "X ea" format
+    match = re.search(r'(\d+)\s*ea', val_str)
+    if match:
+        return int(match.group(1))
+    # Handle plain numbers
+    num = clean_numeric(val)
+    if num and num > 0:
+        return int(num)
+    return 1
+
 def extract_drawing_data(df, col_map):
+    """Extract drawing data using column mapping."""
     items = []
-    no_col, desc_col = col_map.get('no'), col_map.get('description')
-    if not no_col or not desc_col: return None
     
-    for _, row in df.iterrows():
-        no_val = str(row.get(no_col, '')).strip()
-        desc_val = str(row.get(desc_col, '')).strip()
-        if not no_val or no_val.lower() in ('nan', '', 'no', 'item'): continue
-        if not desc_val or desc_val.lower() in ('nan', '', 'description'): continue
-        
-        qty = parse_qty(row.get(col_map.get('qty'), 1)) if col_map.get('qty') else 1
-        cat = int(clean_price(row.get(col_map.get('category'), ''))) if col_map.get('category') and clean_price(row.get(col_map.get('category'), '')) else None
-        equip = str(row.get(col_map.get('equip_num'), '-')).strip() if col_map.get('equip_num') else '-'
-        if equip.lower() in ('nan', '', 'none'): equip = '-'
-        
-        items.append({'No': no_val, 'Equip_Num': equip, 'Description': desc_val, 'Qty': qty, 'Category': cat})
+    no_col = col_map.get('no')
+    desc_col = col_map.get('description')
+    qty_col = col_map.get('qty')
+    cat_col = col_map.get('category')
+    equip_col = col_map.get('equip_num')
+    
+    if not no_col or not desc_col:
+        return None
+    
+    for idx, row in df.iterrows():
+        try:
+            no_val = str(row.get(no_col, '')).strip()
+            desc_val = str(row.get(desc_col, '')).strip()
+            
+            # Skip header rows and empty rows
+            if not no_val or no_val.lower() in ('nan', '', 'no', 'no.', 'item', 'none'):
+                continue
+            if not desc_val or desc_val.lower() in ('nan', '', 'description', 'none'):
+                continue
+            
+            # Get quantity
+            qty = 1
+            if qty_col:
+                qty_val = clean_numeric(row.get(qty_col, 1))
+                if qty_val:
+                    qty = int(qty_val)
+            
+            # Get category
+            cat = None
+            if cat_col:
+                cat_val = clean_numeric(row.get(cat_col, ''))
+                if cat_val:
+                    cat = int(cat_val)
+            
+            # Get equipment number
+            equip_num = '-'
+            if equip_col:
+                en = str(row.get(equip_col, '')).strip()
+                if en and en.lower() not in ('nan', '', '-', 'none'):
+                    equip_num = en
+            
+            items.append({
+                'No': no_val,
+                'Equip_Num': equip_num,
+                'Description': desc_val,
+                'Qty': qty,
+                'Category': cat
+            })
+        except:
+            continue
+    
     return items if items else None
 
 def extract_quote_data(df, col_map, source_file):
+    """Extract quote data using column mapping with NIC handling."""
     items = []
-    no_col, desc_col = col_map.get('no'), col_map.get('description')
     
-    for _, row in df.iterrows():
-        no_val = str(row.get(no_col, '')).strip() if no_col else ''
-        desc_val = str(row.get(desc_col, '')).strip() if desc_col else ''
-        if no_val.lower() in ('nan', 'none'): no_val = ''
-        if desc_val.lower() in ('nan', 'none'): desc_val = ''
-        if not no_val and not desc_val: continue
-        if no_val.lower() in ('item', 'no') or desc_val.lower() == 'description': continue
-        
-        is_nic = 'NIC' in desc_val.upper() or desc_val.upper().strip() == 'NIC'
-        qty = parse_qty(row.get(col_map.get('qty'), '')) if col_map.get('qty') else 1
-        unit_price = clean_price(row.get(col_map.get('unit_price'), 0)) if col_map.get('unit_price') else 0
-        total_price = clean_price(row.get(col_map.get('total_price'), 0)) if col_map.get('total_price') else 0
-        
-        if total_price == 0 and unit_price > 0: total_price = unit_price * qty
-        if unit_price == 0 and total_price > 0 and qty > 0: unit_price = total_price / qty
-        
-        items.append({'Item_No': no_val, 'Description': desc_val, 'Qty': qty, 'Unit_Price': unit_price, 
-                     'Total_Price': total_price, 'Is_NIC': is_nic, 'Source_File': source_file})
+    no_col = col_map.get('no')
+    desc_col = col_map.get('description')
+    qty_col = col_map.get('qty')
+    unit_col = col_map.get('unit_price')
+    total_col = col_map.get('total_price')
+    
+    for idx, row in df.iterrows():
+        try:
+            # Get item number
+            no_val = ''
+            if no_col:
+                no_val = str(row.get(no_col, '')).strip()
+                if no_val.lower() in ('nan', 'none'):
+                    no_val = ''
+            
+            # Get description
+            desc_val = ''
+            if desc_col:
+                desc_val = str(row.get(desc_col, '')).strip()
+                if desc_val.lower() in ('nan', 'none'):
+                    desc_val = ''
+            
+            # Skip if both are empty or look like headers
+            if not no_val and not desc_val:
+                continue
+            if no_val.lower() in ('item', 'no', 'no.', '#', 'line'):
+                continue
+            if desc_val.lower() in ('description', 'item description'):
+                continue
+            
+            # Check for NIC (Not In Contract)
+            is_nic = desc_val.upper().strip() == 'NIC' or 'NIC' in desc_val.upper()
+            
+            # Get quantity
+            qty = 1
+            if qty_col:
+                qty_raw = row.get(qty_col, '')
+                if pd.notna(qty_raw) and str(qty_raw).strip():
+                    qty = parse_qty_value(qty_raw)
+            
+            # Get unit price
+            unit_price = 0
+            if unit_col:
+                up = clean_numeric(row.get(unit_col, 0))
+                if up:
+                    unit_price = up
+            
+            # Get total price
+            total_price = 0
+            if total_col:
+                tp = clean_numeric(row.get(total_col, 0))
+                if tp:
+                    total_price = tp
+            
+            # Calculate total if missing
+            if total_price == 0 and unit_price > 0:
+                total_price = unit_price * qty
+            
+            # Calculate unit price if missing
+            if unit_price == 0 and total_price > 0 and qty > 0:
+                unit_price = total_price / qty
+            
+            items.append({
+                'Item_No': no_val,
+                'Description': desc_val,
+                'Qty': qty,
+                'Unit_Price': unit_price,
+                'Total_Price': total_price,
+                'Is_NIC': is_nic,
+                'Source_File': source_file
+            })
+        except Exception as e:
+            continue
+    
     return items
 
-def match_item(drawing_no, quotes):
-    no_clean = str(drawing_no).strip().lower()
+def match_items(drawing_no, quotes):
+    """Match drawing item to quote by item number."""
+    drawing_no_clean = str(drawing_no).strip().lower()
+    
+    # Exact match
     for q in quotes:
-        if str(q.get('Item_No', '')).strip().lower() == no_clean: return q
+        if str(q.get('Item_No', '')).strip().lower() == drawing_no_clean:
+            return q
+    
+    # Numeric match
     try:
-        draw_num = int(re.sub(r'[^0-9]', '', no_clean))
+        drawing_num = int(re.sub(r'[^0-9]', '', drawing_no_clean))
         for q in quotes:
             try:
-                if draw_num == int(re.sub(r'[^0-9]', '', str(q.get('Item_No', '')))): return q
-            except: pass
-    except: pass
+                quote_num = int(re.sub(r'[^0-9]', '', str(q.get('Item_No', '')).strip()))
+                if drawing_num == quote_num:
+                    return q
+            except:
+                pass
+    except:
+        pass
+    
     return None
 
 def analyze_data(drawing_items, quotes, use_categories=True, supplier_codes=None):
-    if supplier_codes is None: supplier_codes = DEFAULT_SUPPLIER_CODES
-    results = []
+    """Analyze drawing items against quotes."""
+    if supplier_codes is None:
+        supplier_codes = DEFAULT_SUPPLIER_CODES
+    
+    analysis = []
+    
     for item in drawing_items:
-        match = match_item(item['No'], quotes)
+        match = match_items(item['No'], quotes)
         cat = item.get('Category')
         
-        if use_categories and cat in [1, 2, 3]: status, issue = "Owner Supply", supplier_codes.get(cat, "Owner")
-        elif use_categories and cat == 8: status, issue = "Existing", "Existing/relocated"
-        elif item.get('Description', '').upper() in ('SPARE', '-', 'N/A'): status, issue = "N/A", "Spare"
+        # Determine status
+        if use_categories and cat in [1, 2, 3]:
+            status = "Owner Supply"
+            issue = supplier_codes.get(cat, "Owner handles")
+        elif use_categories and cat == 8:
+            status = "Existing"
+            issue = "Existing or relocated"
+        elif item.get('Description', '').upper() in ('SPARE', '-', 'N/A'):
+            status = "N/A"
+            issue = "Spare or placeholder"
         elif match:
-            if match.get('Is_NIC'): status, issue = "NIC", "Not In Contract"
-            elif match['Qty'] == item['Qty']: status, issue = "Quoted", None
-            else: status, issue = "Qty Mismatch", f"Draw:{item['Qty']} vs Quote:{match['Qty']}"
+            if match.get('Is_NIC'):
+                status = "NIC"
+                issue = "Not In Contract"
+            elif match['Qty'] == item['Qty']:
+                status = "Quoted"
+                issue = None
+            else:
+                status = "Qty Mismatch"
+                issue = f"Drawing: {item['Qty']}, Quote: {match['Qty']}"
         else:
-            if use_categories and cat == 7: status, issue = "Needs Pricing", "Owner supply - needs install"
-            elif use_categories and cat in [5, 6]: status, issue = "MISSING", "Critical - needs quote"
-            else: status, issue = "MISSING", "Not in quotes"
+            if use_categories and cat == 7:
+                status = "Needs Pricing"
+                issue = "Owner supplies - needs install pricing"
+            elif use_categories and cat in [5, 6]:
+                status = "MISSING"
+                issue = "Critical - requires quote"
+            else:
+                status = "MISSING"
+                issue = "Not found in quotes"
         
-        results.append({
-            'Drawing_No': item['No'], 'Equip_Num': item.get('Equip_Num', '-'), 'Description': item['Description'],
-            'Drawing_Qty': item['Qty'], 'Category': cat, 'Category_Desc': supplier_codes.get(cat, '-') if cat and use_categories else '-',
-            'Quote_Item_No': match['Item_No'] if match else '-', 'Quote_Qty': match['Qty'] if match else 0,
-            'Unit_Price': match['Unit_Price'] if match else 0, 'Total_Price': match['Total_Price'] if match and not match.get('Is_NIC') else 0,
-            'Quote_Source': match['Source_File'] if match else '-', 'Status': status, 'Issue': issue
+        analysis.append({
+            'Drawing_No': item['No'],
+            'Equip_Num': item.get('Equip_Num', '-'),
+            'Description': item['Description'],
+            'Drawing_Qty': item['Qty'],
+            'Category': cat,
+            'Category_Desc': supplier_codes.get(cat, '-') if cat and use_categories else '-',
+            'Quote_Item_No': match['Item_No'] if match else '-',
+            'Quote_Qty': match['Qty'] if match else 0,
+            'Unit_Price': match['Unit_Price'] if match else 0,
+            'Total_Price': match['Total_Price'] if match and not match.get('Is_NIC') else 0,
+            'Quote_Source': match['Source_File'] if match else '-',
+            'Status': status,
+            'Issue': issue
         })
-    return pd.DataFrame(results)
+    
+    return pd.DataFrame(analysis)
 
 # ===== UI =====
 st.markdown("## 📊 Drawing vs Quote Analyzer")
-if not PDF_SUPPORT: st.warning("⚠️ Install pdfplumber: `pip install pdfplumber`")
+st.caption("Compare equipment schedules against vendor quotations | NIC = Not In Contract")
 
-tabs = st.tabs(["📁 Upload", "📊 Dashboard", "🔍 Analysis", "📋 Summary", "💾 Export"])
+if not PDF_SUPPORT:
+    st.warning("⚠️ PDF support unavailable. Install pdfplumber: `pip install pdfplumber`")
 
+tabs = st.tabs(["📁 Upload & Configure", "📊 Dashboard", "🔍 Analysis", "📋 Summary", "💾 Export"])
+
+# ===== TAB 1: Upload & Configure =====
 with tabs[0]:
-    # Drawing Section
-    st.subheader("1️⃣ Drawing/Schedule")
-    draw_file = st.file_uploader("Upload drawing", type=['pdf', 'csv', 'xlsx', 'xls'], key="draw")
+    st.subheader("1️⃣ Upload Drawing/Schedule")
     
-    if draw_file and draw_file.name != st.session_state.drawing_filename:
-        dfs = parse_file(draw_file)
-        if dfs:
-            st.session_state.drawing_df = max(dfs, key=len).reset_index(drop=True)
-            st.session_state.drawing_filename = draw_file.name
-            st.session_state.column_mapping = auto_detect_cols(st.session_state.drawing_df, 'drawing')
-            st.session_state.drawing_data = None
-            st.rerun()
-        else: st.error("Could not extract drawing data")
+    col1, col2 = st.columns([2, 1])
     
-    if st.session_state.drawing_filename: st.success(f"✅ {st.session_state.drawing_filename}")
-    
-    if st.session_state.drawing_df is not None:
-        df = st.session_state.drawing_df
-        opts = ['-- Not Used --'] + list(df.columns)
-        mapping = st.session_state.column_mapping
+    with col1:
+        draw_file = st.file_uploader(
+            "Upload drawing schedule (PDF, Excel, CSV)", 
+            type=['pdf', 'csv', 'xlsx', 'xls'], 
+            key="draw_upload"
+        )
         
-        with st.expander("Preview & Map Columns", expanded=True):
-            st.dataframe(df.head(10), height=150, use_container_width=True)
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                no_col = st.selectbox("Item No*", opts, index=opts.index(mapping.get('no')) if mapping.get('no') in opts else 0)
-                desc_col = st.selectbox("Description*", opts, index=opts.index(mapping.get('description')) if mapping.get('description') in opts else 0)
-            with c2:
-                qty_col = st.selectbox("Qty", opts, index=opts.index(mapping.get('qty')) if mapping.get('qty') in opts else 0)
-                equip_col = st.selectbox("Equip #", opts, index=opts.index(mapping.get('equip_num')) if mapping.get('equip_num') in opts else 0)
-            with c3:
-                st.session_state.use_categories = st.checkbox("Use Categories", st.session_state.use_categories)
-                cat_col = st.selectbox("Category", opts, index=opts.index(mapping.get('category')) if mapping.get('category') in opts else 0) if st.session_state.use_categories else '-- Not Used --'
+        if draw_file:
+            if draw_file.name != st.session_state.drawing_filename:
+                with st.spinner("Processing drawing..."):
+                    dfs = parse_uploaded_file(draw_file)
+                    if dfs and len(dfs) > 0:
+                        combined = max(dfs, key=len)
+                        combined = combined.reset_index(drop=True)
+                        st.session_state.drawing_df = combined
+                        st.session_state.drawing_filename = draw_file.name
+                        st.session_state.column_mapping = auto_detect_columns(combined, 'drawing')
+                        st.session_state.drawing_data = None
+                        st.rerun()
+                    else:
+                        st.error("Could not extract data from file")
+    
+    with col2:
+        if st.session_state.drawing_filename:
+            st.success(f"✅ {st.session_state.drawing_filename}")
+    
+    # Column mapping for drawing
+    if st.session_state.drawing_df is not None:
+        st.markdown("---")
+        st.subheader("2️⃣ Map Drawing Columns")
+        
+        df = st.session_state.drawing_df
+        col_options = ['-- Not Used --'] + list(df.columns)
+        
+        with st.expander("Preview Drawing Data", expanded=False):
+            st.dataframe(df.head(20), height=250, use_container_width=True)
+        
+        c1, c2, c3 = st.columns(3)
+        
+        with c1:
+            no_idx = col_options.index(st.session_state.column_mapping.get('no', '-- Not Used --')) if st.session_state.column_mapping.get('no') in col_options else 0
+            no_col = st.selectbox("Item No. Column *", col_options, index=no_idx, key="map_no")
             
-            if st.button("✅ Apply Drawing Mapping", type="primary"):
-                new_map = {k: v for k, v in [('no', no_col), ('description', desc_col), ('qty', qty_col), ('equip_num', equip_col), ('category', cat_col)] if v != '-- Not Used --'}
-                st.session_state.column_mapping = new_map
-                items = extract_drawing_data(df, new_map)
-                if items:
-                    st.session_state.drawing_data = items
-                    st.success(f"✅ {len(items)} items extracted")
-                    st.rerun()
-                else: st.error("No items extracted")
+            desc_idx = col_options.index(st.session_state.column_mapping.get('description', '-- Not Used --')) if st.session_state.column_mapping.get('description') in col_options else 0
+            desc_col = st.selectbox("Description Column *", col_options, index=desc_idx, key="map_desc")
+        
+        with c2:
+            qty_idx = col_options.index(st.session_state.column_mapping.get('qty', '-- Not Used --')) if st.session_state.column_mapping.get('qty') in col_options else 0
+            qty_col = st.selectbox("Quantity Column", col_options, index=qty_idx, key="map_qty")
+            
+            equip_idx = col_options.index(st.session_state.column_mapping.get('equip_num', '-- Not Used --')) if st.session_state.column_mapping.get('equip_num') in col_options else 0
+            equip_col = st.selectbox("Equipment/Model # Column", col_options, index=equip_idx, key="map_equip")
+        
+        with c3:
+            st.session_state.use_categories = st.checkbox("Use Category Codes", value=st.session_state.use_categories)
+            
+            if st.session_state.use_categories:
+                cat_idx = col_options.index(st.session_state.column_mapping.get('category', '-- Not Used --')) if st.session_state.column_mapping.get('category') in col_options else 0
+                cat_col = st.selectbox("Category Column", col_options, index=cat_idx, key="map_cat")
+            else:
+                cat_col = '-- Not Used --'
+        
+        if st.button("✅ Apply Drawing Column Mapping", type="primary"):
+            mapping = {}
+            if no_col != '-- Not Used --':
+                mapping['no'] = no_col
+            if desc_col != '-- Not Used --':
+                mapping['description'] = desc_col
+            if qty_col != '-- Not Used --':
+                mapping['qty'] = qty_col
+            if equip_col != '-- Not Used --':
+                mapping['equip_num'] = equip_col
+            if cat_col != '-- Not Used --':
+                mapping['category'] = cat_col
+            
+            st.session_state.column_mapping = mapping
+            
+            items = extract_drawing_data(df, mapping)
+            if items:
+                st.session_state.drawing_data = items
+                st.success(f"✅ Extracted {len(items)} items from drawing")
+                st.rerun()
+            else:
+                st.error("Could not extract data. Check column mapping.")
     
     if st.session_state.drawing_data:
-        st.caption(f"📋 {len(st.session_state.drawing_data)} drawing items loaded")
+        with st.expander(f"📋 Extracted Drawing Items ({len(st.session_state.drawing_data)} items)", expanded=False):
+            st.dataframe(pd.DataFrame(st.session_state.drawing_data), height=300, use_container_width=True)
     
-    # Quote Section
+    # ===== QUOTE SECTION =====
     st.markdown("---")
-    st.subheader("2️⃣ Quotations")
+    st.subheader("3️⃣ Upload & Configure Quotations")
     
-    quote_method = st.radio("Input Method:", ["Upload File", "Paste Data (CSV format)"], horizontal=True)
+    quote_input_method = st.radio("Quote Input Method:", ["📁 Upload File", "📋 Paste Data"], horizontal=True)
     
-    if quote_method == "Upload File":
-        quote_files = st.file_uploader("Upload quotes", type=['pdf', 'csv', 'xlsx', 'xls'], accept_multiple_files=True, key="quotes")
+    if quote_input_method == "📁 Upload File":
+        quote_files = st.file_uploader(
+            "Upload quote files (PDF, Excel, CSV)", 
+            type=['pdf', 'csv', 'xlsx', 'xls'], 
+            accept_multiple_files=True,
+            key="quote_upload"
+        )
         
         if quote_files:
             for qf in quote_files:
                 if qf.name not in st.session_state.quote_dfs:
                     with st.spinner(f"Processing {qf.name}..."):
-                        dfs = parse_file(qf)
-                        if dfs:
-                            combined = pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
-                            st.session_state.quote_dfs[qf.name] = clean_df_columns(combined)
-                            st.session_state.quote_mappings[qf.name] = auto_detect_cols(combined, 'quote')
+                        dfs = parse_uploaded_file(qf)
+                        if dfs and len(dfs) > 0:
+                            combined_df = pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
+                            combined_df = combined_df.reset_index(drop=True)
+                            st.session_state.quote_dfs[qf.name] = combined_df
+                            st.session_state.quote_mappings[qf.name] = auto_detect_columns(combined_df, 'quote')
                             st.rerun()
                         else:
-                            st.error(f"❌ Could not extract from {qf.name}")
-                            # Show debug info
-                            if qf.name.endswith('.pdf') and PDF_SUPPORT:
-                                with st.expander("🔍 Debug: Raw PDF Text (first 3 pages)"):
-                                    text = extract_pdf_all_text(qf)
-                                    st.text_area("Raw text:", text, height=300)
-                                    st.info("💡 If you see the data above, try the 'Paste Data' option instead")
+                            st.error(f"❌ Could not extract data from {qf.name}")
+                            st.info("💡 Try using 'Paste Data' option instead - copy data from PDF and paste in CSV format")
     
     else:  # Paste Data
         st.markdown("**Paste quote data in CSV format:**")
-        st.caption("Format: Item,Qty,Description,Sell,Sell Total (one row per item)")
+        st.caption("Copy from Excel/PDF and paste here. Format: Item, Qty, Description, Sell, Sell Total")
         
-        sample = """Item,Qty,Description,Sell,Sell Total
+        sample_data = """Item,Qty,Description,Sell,Sell Total
 1,,NIC,,
 2,1 ea,WALK IN,97980.27,97980.27
 3,1 ea,WALK IN,70727.09,70727.09
 10,2 ea,STAINLESS,2206.08,4412.16
 11-23,,NIC,,
-24,1 ea,INGREDIENT BIN,386.48,386.48"""
+24,1 ea,INGREDIENT BIN,386.48,395.40
+37,1 ea,HOOD,66746.05,66746.05
+42,1 ea,KETTLE ELECTRIC,9111.11,14790.11
+47,2 ea,COMBI OVEN,20582.70,50568.76"""
         
-        pasted_data = st.text_area("Paste data here:", value="", height=200, placeholder=sample)
-        paste_name = st.text_input("Quote name:", value="Pasted_Quote")
+        with st.expander("📖 See sample format"):
+            st.code(sample_data)
         
-        if st.button("📥 Load Pasted Data") and pasted_data.strip():
-            try:
-                df = pd.read_csv(io.StringIO(pasted_data))
-                df = clean_df_columns(df)
-                st.session_state.quote_dfs[paste_name] = df
-                st.session_state.quote_mappings[paste_name] = auto_detect_cols(df, 'quote')
-                st.success(f"✅ Loaded {len(df)} rows")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error parsing: {e}")
+        pasted_data = st.text_area("Paste your quote data here:", height=200, placeholder="Item,Qty,Description,Sell,Sell Total\n1,,NIC,,\n2,1 ea,WALK IN,97980.27,97980.27")
+        quote_name = st.text_input("Name for this quote:", value="Pasted_Quote")
+        
+        if st.button("📥 Load Pasted Data", type="primary"):
+            if pasted_data.strip():
+                try:
+                    paste_df = pd.read_csv(io.StringIO(pasted_data))
+                    paste_df = clean_dataframe_columns(paste_df)
+                    st.session_state.quote_dfs[quote_name] = paste_df
+                    st.session_state.quote_mappings[quote_name] = auto_detect_columns(paste_df, 'quote')
+                    st.success(f"✅ Loaded {len(paste_df)} rows from pasted data")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error parsing data: {e}")
+                    st.info("Make sure data is in CSV format with comma separators")
+            else:
+                st.warning("Please paste some data first")
     
-    # Configure Quotes
+    # Configure each quote file
     if st.session_state.quote_dfs:
-        st.markdown("**Configure Quote Columns:**")
-        for fname, qdf in st.session_state.quote_dfs.items():
-            with st.expander(f"📄 {fname} ({len(qdf)} rows)", expanded=(fname not in st.session_state.quotes_data)):
-                st.dataframe(qdf.head(15), height=150, use_container_width=True)
+        st.markdown("---")
+        st.markdown("**Configure Quote Column Mappings:**")
+        
+        for filename, qdf in st.session_state.quote_dfs.items():
+            with st.expander(f"📄 {filename} ({len(qdf)} rows)", expanded=(filename not in st.session_state.quotes_data)):
+                st.dataframe(qdf.head(15), height=180, use_container_width=True)
                 
-                opts = ['-- Not Used --'] + list(qdf.columns)
-                qmap = st.session_state.quote_mappings.get(fname, {})
+                q_col_options = ['-- Not Used --'] + list(qdf.columns)
+                current_map = st.session_state.quote_mappings.get(filename, {})
                 
-                c1, c2 = st.columns(2)
-                with c1:
-                    q_no = st.selectbox("Item No", opts, index=opts.index(qmap.get('no')) if qmap.get('no') in opts else 0, key=f"n_{fname}")
-                    q_desc = st.selectbox("Description", opts, index=opts.index(qmap.get('description')) if qmap.get('description') in opts else 0, key=f"d_{fname}")
-                    q_qty = st.selectbox("Qty", opts, index=opts.index(qmap.get('qty')) if qmap.get('qty') in opts else 0, key=f"q_{fname}")
-                with c2:
-                    q_unit = st.selectbox("Unit Price", opts, index=opts.index(qmap.get('unit_price')) if qmap.get('unit_price') in opts else 0, key=f"u_{fname}")
-                    q_total = st.selectbox("Total Price", opts, index=opts.index(qmap.get('total_price')) if qmap.get('total_price') in opts else 0, key=f"t_{fname}")
+                qc1, qc2 = st.columns(2)
                 
-                bc1, bc2 = st.columns(2)
-                with bc1:
-                    if st.button("✅ Apply", key=f"a_{fname}", type="primary"):
-                        new_qmap = {k: v for k, v in [('no', q_no), ('description', q_desc), ('qty', q_qty), ('unit_price', q_unit), ('total_price', q_total)] if v != '-- Not Used --'}
-                        st.session_state.quote_mappings[fname] = new_qmap
-                        items = extract_quote_data(qdf, new_qmap, fname)
+                with qc1:
+                    q_no_idx = q_col_options.index(current_map.get('no')) if current_map.get('no') in q_col_options else 0
+                    q_no_col = st.selectbox("Item No.", q_col_options, index=q_no_idx, key=f"q_no_{filename}")
+                    
+                    q_desc_idx = q_col_options.index(current_map.get('description')) if current_map.get('description') in q_col_options else 0
+                    q_desc_col = st.selectbox("Description", q_col_options, index=q_desc_idx, key=f"q_desc_{filename}")
+                    
+                    q_qty_idx = q_col_options.index(current_map.get('qty')) if current_map.get('qty') in q_col_options else 0
+                    q_qty_col = st.selectbox("Quantity", q_col_options, index=q_qty_idx, key=f"q_qty_{filename}")
+                
+                with qc2:
+                    q_unit_idx = q_col_options.index(current_map.get('unit_price')) if current_map.get('unit_price') in q_col_options else 0
+                    q_unit_col = st.selectbox("Unit Price (Sell)", q_col_options, index=q_unit_idx, key=f"q_unit_{filename}")
+                    
+                    q_total_idx = q_col_options.index(current_map.get('total_price')) if current_map.get('total_price') in q_col_options else 0
+                    q_total_col = st.selectbox("Total Price (Sell Total)", q_col_options, index=q_total_idx, key=f"q_total_{filename}")
+                
+                bcol1, bcol2 = st.columns(2)
+                
+                with bcol1:
+                    if st.button(f"✅ Apply Mapping", key=f"apply_{filename}", type="primary"):
+                        q_mapping = {}
+                        if q_no_col != '-- Not Used --':
+                            q_mapping['no'] = q_no_col
+                        if q_desc_col != '-- Not Used --':
+                            q_mapping['description'] = q_desc_col
+                        if q_qty_col != '-- Not Used --':
+                            q_mapping['qty'] = q_qty_col
+                        if q_unit_col != '-- Not Used --':
+                            q_mapping['unit_price'] = q_unit_col
+                        if q_total_col != '-- Not Used --':
+                            q_mapping['total_price'] = q_total_col
+                        
+                        st.session_state.quote_mappings[filename] = q_mapping
+                        
+                        items = extract_quote_data(qdf, q_mapping, filename)
                         if items:
-                            st.session_state.quotes_data[fname] = items
-                            nic = sum(1 for i in items if i.get('Is_NIC'))
-                            st.success(f"✅ {len(items)} items ({nic} NIC)")
+                            st.session_state.quotes_data[filename] = items
+                            nic_count = sum(1 for i in items if i.get('Is_NIC'))
+                            total_val = sum(i['Total_Price'] for i in items if not i.get('Is_NIC'))
+                            st.success(f"✅ Extracted {len(items)} items ({nic_count} NIC) | ${total_val:,.2f}")
                             st.rerun()
-                        else: st.error("No items extracted")
-                with bc2:
-                    if st.button("🗑️ Remove", key=f"r_{fname}"):
-                        del st.session_state.quote_dfs[fname]
-                        st.session_state.quotes_data.pop(fname, None)
-                        st.session_state.quote_mappings.pop(fname, None)
+                        else:
+                            st.error(f"No items extracted. Check column mapping.")
+                
+                with bcol2:
+                    if st.button(f"🗑️ Remove", key=f"remove_{filename}"):
+                        del st.session_state.quote_dfs[filename]
+                        if filename in st.session_state.quotes_data:
+                            del st.session_state.quotes_data[filename]
+                        if filename in st.session_state.quote_mappings:
+                            del st.session_state.quote_mappings[filename]
                         st.rerun()
                 
-                if fname in st.session_state.quotes_data:
-                    items = st.session_state.quotes_data[fname]
-                    nic = sum(1 for i in items if i.get('Is_NIC'))
+                if filename in st.session_state.quotes_data:
+                    items = st.session_state.quotes_data[filename]
+                    nic_count = sum(1 for i in items if i.get('Is_NIC'))
                     total = sum(i['Total_Price'] for i in items if not i.get('Is_NIC'))
-                    st.success(f"✅ Loaded: {len(items)} items | {nic} NIC | ${total:,.2f}")
+                    st.success(f"✅ {len(items)} items | {nic_count} NIC | Total: ${total:,.2f}")
     
+    # Summary
     if st.session_state.quotes_data:
         st.markdown("---")
+        st.subheader("📊 Loaded Quotes Summary")
         for fn, qs in st.session_state.quotes_data.items():
-            nic = sum(1 for q in qs if q.get('Is_NIC'))
+            nic_count = sum(1 for q in qs if q.get('Is_NIC'))
             total = sum(q['Total_Price'] for q in qs if not q.get('Is_NIC'))
-            st.caption(f"✅ {fn}: {len(qs)} items ({nic} NIC) = ${total:,.2f}")
+            st.caption(f"• **{fn}**: {len(qs)} items ({nic_count} NIC) = ${total:,.2f}")
     
-    if st.button("🔄 Reset All"):
-        for k in ['drawing_data', 'drawing_df', 'quotes_data', 'quote_dfs', 'quote_mappings', 'drawing_filename', 'column_mapping']:
-            st.session_state[k] = {} if 'data' in k or 'dfs' in k or 'map' in k else None
+    st.markdown("---")
+    if st.button("🔄 Reset Everything"):
+        st.session_state.drawing_data = None
+        st.session_state.drawing_df = None
+        st.session_state.quotes_data = {}
+        st.session_state.quote_dfs = {}
+        st.session_state.quote_mappings = {}
+        st.session_state.drawing_filename = None
+        st.session_state.column_mapping = {}
         st.rerun()
 
+# ===== TAB 2: Dashboard =====
 with tabs[1]:
-    if not st.session_state.drawing_data: st.warning("⚠️ Configure drawing first")
-    elif not st.session_state.quotes_data: st.warning("⚠️ Configure quotes first")
+    if not st.session_state.drawing_data:
+        st.warning("⚠️ Please upload and configure drawing first (Tab 1)")
+    elif not st.session_state.quotes_data:
+        st.warning("⚠️ Please upload and configure quotations (Tab 1)")
+        if st.session_state.quote_dfs:
+            st.info("💡 You have quote files loaded but haven't applied column mapping. Go to Tab 1 and click 'Apply Mapping'.")
     else:
         all_quotes = [q for qs in st.session_state.quotes_data.values() for q in qs]
         df = analyze_data(st.session_state.drawing_data, all_quotes, st.session_state.use_categories, st.session_state.supplier_codes)
         
         st.subheader("📊 Coverage Summary")
-        actionable = df[~df['Status'].isin(['Owner Supply', 'Existing', 'N/A'])]
+        
+        exclude_statuses = ['Owner Supply', 'Existing', 'N/A']
+        actionable = df[~df['Status'].isin(exclude_statuses)]
         
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("✅ Quoted", len(df[df['Status'] == 'Quoted']))
         c2.metric("❌ Missing", len(df[df['Status'] == 'MISSING']))
-        c3.metric("⚠️ Mismatch", len(df[df['Status'] == 'Qty Mismatch']))
+        c3.metric("⚠️ Qty Mismatch", len(df[df['Status'] == 'Qty Mismatch']))
         c4.metric("🚫 NIC", len(df[df['Status'] == 'NIC']))
-        c5.metric("📋 Needs Price", len(df[df['Status'] == 'Needs Pricing']))
+        c5.metric("📋 Needs Pricing", len(df[df['Status'] == 'Needs Pricing']))
         
         col1, col2 = st.columns(2)
-        col1.metric("💰 Quoted Value", f"${df['Total_Price'].sum():,.2f}")
+        col1.metric("💰 Total Quoted Value", f"${df['Total_Price'].sum():,.2f}")
         col2.metric("📦 Total Items", f"{len(df)} ({len(actionable)} actionable)")
         
         ch1, ch2 = st.columns(2)
+        
         with ch1:
             vc = df['Status'].value_counts().reset_index()
             vc.columns = ['Status', 'Count']
-            colors = {'Quoted': '#28a745', 'MISSING': '#dc3545', 'Qty Mismatch': '#ffc107', 'NIC': '#6f42c1', 'Needs Pricing': '#fd7e14', 'Owner Supply': '#6c757d', 'Existing': '#adb5bd', 'N/A': '#e9ecef'}
+            colors = {
+                'Quoted': '#28a745', 'MISSING': '#dc3545', 'Qty Mismatch': '#ffc107',
+                'NIC': '#6f42c1', 'Needs Pricing': '#fd7e14', 'Owner Supply': '#6c757d', 
+                'Existing': '#adb5bd', 'N/A': '#e9ecef'
+            }
             fig = px.pie(vc, values='Count', names='Status', color='Status', color_discrete_map=colors, title="Status Distribution")
             st.plotly_chart(fig, use_container_width=True)
+        
         with ch2:
-            fig2 = px.bar(vc, x='Status', y='Count', color='Status', color_discrete_map=colors, title="Items by Status")
+            fig2 = px.bar(vc, x='Status', y='Count', title="Items by Status", color='Status', color_discrete_map=colors)
             st.plotly_chart(fig2, use_container_width=True)
 
+# ===== TAB 3: Analysis =====
 with tabs[2]:
     if st.session_state.drawing_data and st.session_state.quotes_data:
         all_quotes = [q for qs in st.session_state.quotes_data.values() for q in qs]
         df = analyze_data(st.session_state.drawing_data, all_quotes, st.session_state.use_categories, st.session_state.supplier_codes)
         
-        filt = st.multiselect("Filter Status", df['Status'].unique().tolist(), default=df['Status'].unique().tolist())
-        fdf = df[df['Status'].isin(filt)]
+        st.subheader("🔍 Detailed Analysis")
         
-        def hl(row):
-            c = {'Quoted': '#d4edda', 'MISSING': '#f8d7da', 'Qty Mismatch': '#fff3cd', 'NIC': '#e2d5f0', 'Needs Pricing': '#ffe5d0'}
-            return [f'background-color:{c.get(row["Status"], "")}'] * len(row)
+        col1, col2 = st.columns(2)
+        status_opts = df['Status'].unique().tolist()
+        filt_status = col1.multiselect("Filter by Status", status_opts, default=status_opts)
         
-        cols = ['Drawing_No', 'Description', 'Drawing_Qty', 'Quote_Item_No', 'Quote_Qty', 'Total_Price', 'Status', 'Issue']
-        st.dataframe(fdf[cols].style.apply(hl, axis=1), height=400, use_container_width=True)
+        fdf = df[df['Status'].isin(filt_status)]
         
-        critical = df[df['Status'] == 'MISSING']
+        def highlight_row(row):
+            colors = {
+                'Quoted': 'background-color:#d4edda',
+                'MISSING': 'background-color:#f8d7da',
+                'Qty Mismatch': 'background-color:#fff3cd',
+                'NIC': 'background-color:#e2d5f0',
+                'Needs Pricing': 'background-color:#ffe5d0'
+            }
+            return [colors.get(row['Status'], '')] * len(row)
+        
+        display_cols = ['Drawing_No', 'Equip_Num', 'Description', 'Drawing_Qty']
+        if st.session_state.use_categories:
+            display_cols.append('Category')
+        display_cols.extend(['Quote_Item_No', 'Quote_Qty', 'Unit_Price', 'Total_Price', 'Status', 'Issue'])
+        
+        st.dataframe(fdf[display_cols].style.apply(highlight_row, axis=1), height=450, use_container_width=True)
+        
+        # Critical missing
+        st.subheader("🚨 Critical Missing Items")
+        if st.session_state.use_categories:
+            critical = df[(df['Status'] == 'MISSING') & (df['Category'].isin([5, 6]))]
+        else:
+            critical = df[df['Status'] == 'MISSING']
+        
         if len(critical) > 0:
-            st.error(f"🚨 {len(critical)} MISSING items!")
-            st.dataframe(critical[['Drawing_No', 'Description', 'Drawing_Qty']], use_container_width=True)
-    else: st.warning("⚠️ Configure data first")
+            st.error(f"⚠️ {len(critical)} items require quotes!")
+            st.dataframe(critical[['Drawing_No', 'Equip_Num', 'Description', 'Drawing_Qty']], use_container_width=True)
+        else:
+            st.success("✅ No critical missing items!")
+        
+        # NIC Items
+        nic_items = df[df['Status'] == 'NIC']
+        if len(nic_items) > 0:
+            st.subheader("🚫 NIC Items (Not In Contract)")
+            st.info(f"{len(nic_items)} items marked as NIC - excluded from vendor scope")
+            st.dataframe(nic_items[['Drawing_No', 'Description', 'Drawing_Qty']], use_container_width=True)
+    else:
+        st.warning("⚠️ Please upload and configure both drawing and quotations first")
 
+# ===== TAB 4: Summary =====
 with tabs[3]:
     if st.session_state.drawing_data and st.session_state.quotes_data:
         all_quotes = [q for qs in st.session_state.quotes_data.values() for q in qs]
         df = analyze_data(st.session_state.drawing_data, all_quotes, st.session_state.use_categories, st.session_state.supplier_codes)
-        summary = df.groupby('Status').agg(Items=('Status', 'count'), Value=('Total_Price', 'sum')).reset_index()
-        summary['Value'] = summary['Value'].apply(lambda x: f"${x:,.2f}")
-        st.dataframe(summary, use_container_width=True)
-    else: st.warning("⚠️ Configure data first")
+        
+        st.subheader("📋 Summary by Status")
+        status_summary = df.groupby('Status').agg(
+            Items=('Status', 'count'),
+            Total_Value=('Total_Price', 'sum')
+        ).reset_index()
+        status_summary['Total_Value'] = status_summary['Total_Value'].apply(lambda x: f"${x:,.2f}")
+        st.dataframe(status_summary, use_container_width=True)
+        
+        if st.session_state.use_categories and df['Category'].notna().any():
+            st.subheader("📋 Summary by Category")
+            summary = []
+            for code, desc in st.session_state.supplier_codes.items():
+                ci = df[df['Category'] == code]
+                if len(ci) > 0:
+                    summary.append({
+                        'Category': code,
+                        'Description': desc,
+                        'Items': len(ci),
+                        'Quoted': len(ci[ci['Status'] == 'Quoted']),
+                        'Missing': len(ci[ci['Status'] == 'MISSING']),
+                        'NIC': len(ci[ci['Status'] == 'NIC']),
+                        'Value': f"${ci['Total_Price'].sum():,.2f}"
+                    })
+            if summary:
+                st.dataframe(pd.DataFrame(summary), use_container_width=True)
+        
+        st.subheader("📄 Quote Files Summary")
+        quote_summary = []
+        for fn, qs in st.session_state.quotes_data.items():
+            nic_count = sum(1 for q in qs if q.get('Is_NIC'))
+            quote_summary.append({
+                'File': fn,
+                'Total Items': len(qs),
+                'NIC Items': nic_count,
+                'Priced Items': len(qs) - nic_count,
+                'Total Value': f"${sum(q['Total_Price'] for q in qs if not q.get('Is_NIC')):,.2f}"
+            })
+        st.dataframe(pd.DataFrame(quote_summary), use_container_width=True)
+    else:
+        st.warning("⚠️ Please upload and configure both drawing and quotations first")
 
+# ===== TAB 5: Export =====
 with tabs[4]:
+    st.subheader("💾 Export Data")
+    
     if st.session_state.drawing_data and st.session_state.quotes_data:
         all_quotes = [q for qs in st.session_state.quotes_data.values() for q in qs]
         df = analyze_data(st.session_state.drawing_data, all_quotes, st.session_state.use_categories, st.session_state.supplier_codes)
         
         out = io.BytesIO()
-        with pd.ExcelWriter(out, engine='openpyxl') as w:
-            df.to_excel(w, sheet_name='Full', index=False)
-            df[df['Status'] == 'MISSING'].to_excel(w, sheet_name='Missing', index=False)
-            df[df['Status'] == 'NIC'].to_excel(w, sheet_name='NIC', index=False)
+        with pd.ExcelWriter(out, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Full Analysis', index=False)
+            df[df['Status'] == 'MISSING'].to_excel(writer, sheet_name='Missing Items', index=False)
+            df[df['Status'] == 'Quoted'].to_excel(writer, sheet_name='Quoted Items', index=False)
+            df[df['Status'] == 'NIC'].to_excel(writer, sheet_name='NIC Items', index=False)
+            df[df['Status'] == 'Qty Mismatch'].to_excel(writer, sheet_name='Qty Mismatch', index=False)
+            pd.DataFrame(all_quotes).to_excel(writer, sheet_name='All Quotes Raw', index=False)
         out.seek(0)
-        st.download_button("📥 Download Report", out, f"Analysis_{datetime.now().strftime('%Y%m%d')}.xlsx", type="primary")
-    else: st.warning("⚠️ Configure data first")
+        
+        st.download_button(
+            "📥 Download Full Analysis Report",
+            out,
+            f"Analysis_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
+        
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.session_state.drawing_data:
+                st.markdown("**Drawing Data**")
+                eq_df = pd.DataFrame(st.session_state.drawing_data)
+                out_eq = io.BytesIO()
+                eq_df.to_excel(out_eq, index=False)
+                out_eq.seek(0)
+                st.download_button("📥 Download Drawing Data", out_eq, f"Drawing_{datetime.now().strftime('%Y%m%d')}.xlsx")
+        
+        with col2:
+            if st.session_state.quotes_data:
+                st.markdown("**Quote Data**")
+                all_q = [q for qs in st.session_state.quotes_data.values() for q in qs]
+                q_df = pd.DataFrame(all_q)
+                out_q = io.BytesIO()
+                q_df.to_excel(out_q, index=False)
+                out_q.seek(0)
+                st.download_button("📥 Download Quote Data", out_q, f"Quotes_{datetime.now().strftime('%Y%m%d')}.xlsx")
+    else:
+        st.warning("⚠️ Please upload and configure both drawing and quotations first")
 
-st.caption("v9.0 | NIC = Not In Contract")
+st.markdown("---")
+st.caption("Universal Drawing Quote Analyzer v10.0 | NIC = Not In Contract")
